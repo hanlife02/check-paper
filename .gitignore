@@ -1,0 +1,7 @@
+paper/*
+data/
+.env
+.paper-check.json
+target/
+__pycache__/
+*.pyc

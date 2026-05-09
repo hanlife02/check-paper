@@ -1,0 +1,32 @@
+[package]
+name = "paper-check"
+version = "0.1.1"
+edition = "2024"
+description = "Analyze a researcher's local paper archive and answer questions with LLM-backed retrieval."
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.12"
+
+[[bin]]
+name = "ppc"
+path = "src/bin/ppc.rs"
+
+[[bin]]
+name = "paper-check"
+path = "src/bin/paper_check.rs"
+
+[[bin]]
+name = "check-paper"
+path = "src/bin/check_paper.rs"
