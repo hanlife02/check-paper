@@ -1,8 +1,11 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
 
 use crate::bots::handlers::BotHandlers;
 use crate::bots::telegram_bot::TelegramBot;
@@ -188,6 +191,7 @@ fn cmd_llm_config(args: LlmConfigArgs) -> Result<()> {
             "CHECK_PAPER_LLM_BASE_URL",
             "CHECK_PAPER_LLM_API_KEY",
             "CHECK_PAPER_LLM_MODEL",
+            "CHECK_PAPER_LLM_TIMEOUT_SECS",
         ])?;
         return Ok(());
     }
@@ -224,6 +228,17 @@ fn cmd_llm_config(args: LlmConfigArgs) -> Result<()> {
                 .get("CHECK_PAPER_LLM_MODEL")
                 .map(String::as_str)
                 .unwrap_or(""),
+            false,
+        )?,
+    );
+    updates.insert(
+        "CHECK_PAPER_LLM_TIMEOUT_SECS".to_string(),
+        prompt_value(
+            "timeout-secs",
+            current
+                .get("CHECK_PAPER_LLM_TIMEOUT_SECS")
+                .map(String::as_str)
+                .unwrap_or("180"),
             false,
         )?,
     );
@@ -328,6 +343,37 @@ fn print_config(keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn progress_bar(len: u64, prefix: &'static str) -> ProgressBar {
+    let progress = ProgressBar::new(len);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{prefix:.bold} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    progress.set_prefix(prefix);
+    progress
+}
+
+fn paper_progress(message: String) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] {msg}")
+            .unwrap()
+            .tick_chars("|/-\\"),
+    );
+    progress.enable_steady_tick(Duration::from_millis(120));
+    progress.set_message(message);
+    progress
+}
+
+fn display_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 fn cmd_scan(args: AuthorArgs, settings: &Settings) -> Result<()> {
     let paper_dirs = scan_paper_dirs(&settings.paper_root, args.author.as_deref())?;
     println!("found {} paper directories", paper_dirs.len());
@@ -344,18 +390,21 @@ fn cmd_ingest(args: AuthorArgs, settings: &Settings) -> Result<()> {
     let mut storage = Storage::open(&settings.db_path)?;
     let paper_dirs = scan_paper_dirs(&settings.paper_root, args.author.as_deref())?;
     let mut changed_count = 0usize;
+    let progress = progress_bar(paper_dirs.len() as u64, "ingesting");
     for paper_dir in &paper_dirs {
+        progress.set_message(display_name(paper_dir));
         let paper = load_paper(&settings.paper_root, paper_dir)?;
         let chunks = chunk_paper(&paper, 3200, 350);
         if storage.upsert_paper(&paper, &chunks)? {
             changed_count += 1;
         }
+        progress.inc(1);
     }
-    println!(
+    progress.finish_with_message(format!(
         "ingested {} papers; changed {}",
         paper_dirs.len(),
         changed_count
-    );
+    ));
     Ok(())
 }
 
@@ -369,19 +418,34 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
         rows.truncate(limit);
     }
     println!("papers needing analysis: {}", rows.len());
+    let mut failures = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let paper_dir = settings.paper_root.join(&row.author).join(&row.paper_id);
         let paper = load_paper(&settings.paper_root, &paper_dir)?;
-        println!(
-            "[{}/{}] analyzing {} {}",
+        let message = format!(
+            "[{}/{}] {} {}",
             index + 1,
             rows.len(),
             paper.year(),
             paper.title()
         );
-        let profile = analyze_paper(&paper, &llm, 22000)?;
-        storage.save_paper_profile(&paper.key(), &paper.source_hash, &profile)?;
+        let progress = paper_progress(message.clone());
+        match analyze_paper_with_retries(&paper, &llm, &progress, &message) {
+            Ok(profile) => {
+                storage.save_paper_profile(&paper.key(), &paper.source_hash, &profile)?;
+                progress.finish_with_message(format!("{message} done"));
+            }
+            Err(err) => {
+                progress.finish_with_message(format!("{message} failed"));
+                failures.push((paper.key(), err.to_string()));
+            }
+        }
     }
+    println!(
+        "analyzed {}; failed {}",
+        rows.len().saturating_sub(failures.len()),
+        failures.len()
+    );
 
     if !args.skip_author_profile {
         let profiles = storage.paper_profiles(&author, None)?;
@@ -394,7 +458,42 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
             );
         }
     }
+    if !failures.is_empty() {
+        println!(
+            "analysis completed with {} failed papers; rerun later to retry them",
+            failures.len()
+        );
+        for (paper_key, err) in failures.iter().take(20) {
+            println!("- {paper_key}: {err}");
+        }
+        if failures.len() > 20 {
+            println!("- ... {} more", failures.len() - 20);
+        }
+    }
     Ok(())
+}
+
+fn analyze_paper_with_retries(
+    paper: &crate::papers::models::Paper,
+    llm: &OpenAiCompatibleClient,
+    progress: &ProgressBar,
+    message: &str,
+) -> Result<serde_json::Value> {
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        progress.set_message(format!("{message} attempt {attempt}/3"));
+        match analyze_paper(paper, llm, 22000) {
+            Ok(profile) => return Ok(profile),
+            Err(err) => {
+                progress.println(format!("{message} attempt {attempt}/3 failed: {err}"));
+                last_error = Some(err);
+                if attempt < 3 {
+                    thread::sleep(Duration::from_secs(2 * attempt));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("analysis failed")))
 }
 
 fn cmd_ask(args: AskArgs, settings: &Settings) -> Result<()> {
@@ -464,5 +563,6 @@ fn make_llm(settings: &Settings) -> Result<OpenAiCompatibleClient> {
         api_key: settings.llm_api_key.clone(),
         model: settings.llm_model.clone(),
         proxy: settings.proxy.clone(),
+        timeout_secs: settings.llm_timeout_secs,
     })
 }

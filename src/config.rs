@@ -17,6 +17,7 @@ pub struct Settings {
     pub llm_base_url: String,
     pub llm_api_key: Option<String>,
     pub llm_model: String,
+    pub llm_timeout_secs: u64,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_ids: Vec<i64>,
 }
@@ -42,6 +43,8 @@ impl Settings {
             .to_string(),
             llm_api_key: empty_to_none(setting(&config, "CHECK_PAPER_LLM_API_KEY", "")),
             llm_model: setting(&config, "CHECK_PAPER_LLM_MODEL", ""),
+            llm_timeout_secs: parse_u64(&setting(&config, "CHECK_PAPER_LLM_TIMEOUT_SECS", "180"))
+                .unwrap_or(180),
             telegram_bot_token: empty_to_none(setting(&config, "TELEGRAM_BOT_TOKEN", "")),
             telegram_chat_ids: parse_i64_list(&setting(&config, "TELEGRAM_CHAT_IDS", "")),
         }
@@ -89,9 +92,7 @@ pub fn save_config(updates: &BTreeMap<String, String>, path: Option<&Path>) -> R
     let path = path.map(PathBuf::from).unwrap_or_else(config_path);
     let mut config = load_config(Some(&path)).unwrap_or_default();
     for (key, value) in updates {
-        if !value.is_empty() {
-            config.insert(key.clone(), value.clone());
-        }
+        config.insert(key.clone(), value.clone());
     }
     if let Some(parent) = path.parent() {
         if parent != Path::new("") {
@@ -152,6 +153,10 @@ fn parse_i64_list(value: &str) -> Vec<i64> {
         .split(',')
         .filter_map(|item| item.trim().parse::<i64>().ok())
         .collect()
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
 }
 
 #[cfg(test)]

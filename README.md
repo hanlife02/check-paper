@@ -37,7 +37,7 @@ ppc llm config
 ppc tg config
 ```
 
-这些配置命令会逐项提示输入，例如 `ppc config` 会依次询问 `db-path`、`default-author`、`proxy`。`proxy` 可选，格式例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`，会用于 LLM 和 Telegram 请求。`ppc llm config` 会依次询问 `base-url`、`api-key`、`model`。`ppc tg config` 会询问 `bot-token` 和可选的 `chat-ids`；多个 chat id 用英文逗号分隔，不填则不限制聊天。
+这些配置命令会逐项提示输入，例如 `ppc config` 会依次询问 `db-path`、`default-author`、`proxy`。`proxy` 可选，格式例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`，会用于 LLM 和 Telegram 请求。`ppc llm config` 会依次询问 `base-url`、`api-key`、`model`、`timeout-secs`，默认 LLM 请求超时为 180 秒。`ppc tg config` 会询问 `bot-token` 和可选的 `chat-ids`；多个 chat id 用英文逗号分隔，不填则不限制聊天。
 
 查看配置：
 
@@ -66,6 +66,8 @@ ppc serve-telegram
 ```bash
 ppc sync --author "Ruqiang ZOU"
 ```
+
+`ppc sync` 会显示入库和分析进度。分析阶段每篇论文都会显示独立的处理进度，当前论文完成后再进入下一篇；每篇论文会自动重试，单篇失败会记录后继续处理后续论文，最后汇总失败列表。之后重新运行 `ppc sync` 会继续重试未成功分析的论文。
 
 ## Telegram 用法
 

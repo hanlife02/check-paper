@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Result, anyhow};
 use reqwest::Proxy;
 use reqwest::blocking::{Client, ClientBuilder};
@@ -9,6 +11,7 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub model: String,
     pub proxy: Option<String>,
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,7 +28,7 @@ pub struct OpenAiCompatibleClient {
 
 impl OpenAiCompatibleClient {
     pub fn new(config: LlmConfig) -> Result<Self> {
-        let http = http_client(config.proxy.as_deref())?;
+        let http = http_client(config.proxy.as_deref(), config.timeout_secs)?;
         Ok(Self { config, http })
     }
 
@@ -66,8 +69,8 @@ impl OpenAiCompatibleClient {
     }
 }
 
-fn http_client(proxy: Option<&str>) -> Result<Client> {
-    let mut builder = ClientBuilder::new();
+fn http_client(proxy: Option<&str>, timeout_secs: u64) -> Result<Client> {
+    let mut builder = ClientBuilder::new().timeout(Duration::from_secs(timeout_secs));
     if let Some(proxy) = proxy {
         builder = builder.proxy(Proxy::all(proxy)?);
     }

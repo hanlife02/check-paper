@@ -8,6 +8,11 @@ use serde::Deserialize;
 
 use super::handlers::BotHandlers;
 
+const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
+const TELEGRAM_REQUEST_TIMEOUT_SECS: u64 = TELEGRAM_POLL_TIMEOUT_SECS + 20;
+const TELEGRAM_POLL_RETRY_DELAY_SECS: u64 = 3;
+const TELEGRAM_MESSAGE_PREVIEW_CHARS: usize = 80;
+
 pub struct TelegramBot<'a> {
     token: String,
     allowed_chat_ids: Vec<i64>,
@@ -32,18 +37,43 @@ impl<'a> TelegramBot<'a> {
 
     pub fn run_polling(&self) -> Result<()> {
         let bot_username = self.get_me()?.username;
+        eprintln!(
+            "Telegram bot started as {}; allowed chats: {}",
+            format_bot_username(bot_username.as_deref()),
+            format_allowed_chat_ids(&self.allowed_chat_ids)
+        );
         let mut offset = 0i64;
         loop {
-            let updates = self.get_updates(offset)?;
+            let updates = match self.get_updates(offset) {
+                Ok(updates) => updates,
+                Err(err) if is_recoverable_poll_error(&err) => {
+                    eprintln!("Telegram polling temporarily failed: {err}");
+                    thread::sleep(Duration::from_secs(TELEGRAM_POLL_RETRY_DELAY_SECS));
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             for update in updates {
                 offset = offset.max(update.update_id + 1);
                 let Some(message) = update.message.or(update.edited_message) else {
                     continue;
                 };
                 let Some(text) = message.text.as_deref() else {
+                    eprintln!(
+                        "Telegram update {} ignored: non-text message in chat {} ({})",
+                        update.update_id, message.chat.id, message.chat.kind
+                    );
                     continue;
                 };
-                if !self.can_handle_message(&message, &text, bot_username.as_deref()) {
+                eprintln!(
+                    "Telegram update {} received: chat {} ({}) text=\"{}\"",
+                    update.update_id,
+                    message.chat.id,
+                    message.chat.kind,
+                    preview_text(text)
+                );
+                if let Some(reason) = self.skip_reason(&message, text, bot_username.as_deref()) {
+                    eprintln!("Telegram update {} ignored: {reason}", update.update_id);
                     continue;
                 }
                 let text = strip_bot_mention(&text, bot_username.as_deref());
@@ -57,21 +87,27 @@ impl<'a> TelegramBot<'a> {
         }
     }
 
-    fn can_handle_message(
+    fn skip_reason(
         &self,
         message: &Message,
         text: &str,
         bot_username: Option<&str>,
-    ) -> bool {
+    ) -> Option<&'static str> {
         if !self.allowed_chat_ids.is_empty() && !self.allowed_chat_ids.contains(&message.chat.id) {
-            return false;
+            return Some("chat is not in TELEGRAM_CHAT_IDS");
         }
 
         if message.chat.is_private() {
-            return true;
+            return None;
         }
 
-        bot_username.is_some_and(|username| mentions_bot(text, username))
+        if bot_username.is_some_and(|username| mentions_bot(text, username))
+            || is_untargeted_bot_command(text)
+        {
+            return None;
+        }
+
+        Some("group message must mention this bot or use /start, /profile, or /ask")
     }
 
     fn get_me(&self) -> Result<User> {
@@ -92,7 +128,7 @@ impl<'a> TelegramBot<'a> {
                 self.token
             ))
             .query(&[
-                ("timeout", "30".to_string()),
+                ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
                 ("offset", offset.to_string()),
             ])
             .send()?
@@ -120,11 +156,52 @@ impl<'a> TelegramBot<'a> {
 }
 
 fn http_client(proxy: Option<&str>) -> Result<Client> {
-    let mut builder = ClientBuilder::new();
+    let mut builder =
+        ClientBuilder::new().timeout(Duration::from_secs(TELEGRAM_REQUEST_TIMEOUT_SECS));
     if let Some(proxy) = proxy {
         builder = builder.proxy(Proxy::all(proxy)?);
     }
     Ok(builder.build()?)
+}
+
+fn is_recoverable_poll_error(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<reqwest::Error>() else {
+        return false;
+    };
+
+    if error.is_timeout() || error.is_connect() {
+        return true;
+    }
+
+    error.status().is_some_and(|status| {
+        status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    })
+}
+
+fn format_bot_username(bot_username: Option<&str>) -> String {
+    bot_username
+        .map(|username| format!("@{username}"))
+        .unwrap_or_else(|| "<unknown username>".to_string())
+}
+
+fn format_allowed_chat_ids(allowed_chat_ids: &[i64]) -> String {
+    if allowed_chat_ids.is_empty() {
+        "all".to_string()
+    } else {
+        allowed_chat_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn preview_text(text: &str) -> String {
+    let mut preview: String = text.chars().take(TELEGRAM_MESSAGE_PREVIEW_CHARS).collect();
+    if text.chars().count() > TELEGRAM_MESSAGE_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
 }
 
 #[derive(Deserialize)]
@@ -169,6 +246,13 @@ fn mentions_bot(text: &str, bot_username: &str) -> bool {
         .any(|word| token_has_bot_mention(word, &mention))
 }
 
+fn is_untargeted_bot_command(text: &str) -> bool {
+    matches!(
+        text.split_whitespace().next(),
+        Some("/start" | "/profile" | "/ask")
+    )
+}
+
 fn strip_bot_mention(text: &str, bot_username: Option<&str>) -> String {
     let Some(bot_username) = bot_username else {
         return text.to_string();
@@ -205,7 +289,7 @@ fn is_command_boundary(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{mentions_bot, strip_bot_mention};
+    use super::{is_untargeted_bot_command, mentions_bot, strip_bot_mention};
 
     #[test]
     fn detects_plain_group_mention() {
@@ -227,6 +311,14 @@ mod tests {
             strip_bot_mention("/ask@PaperCheckBot 问题", Some("PaperCheckBot")),
             "/ask 问题"
         );
+    }
+
+    #[test]
+    fn detects_untargeted_commands() {
+        assert!(is_untargeted_bot_command("/ask 问题"));
+        assert!(is_untargeted_bot_command("/profile"));
+        assert!(!is_untargeted_bot_command("/ask@OtherBot 问题"));
+        assert!(!is_untargeted_bot_command("普通问题"));
     }
 
     #[test]
