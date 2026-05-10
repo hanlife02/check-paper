@@ -4,6 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::process;
 use std::thread;
 use std::time::Duration;
 
@@ -100,6 +101,7 @@ struct AskArgs {
 }
 
 pub fn run() -> Result<()> {
+    install_ctrlc_handler()?;
     let cli = Cli::parse();
     match cli.command {
         Command::Config(args) => cmd_config(args),
@@ -132,6 +134,14 @@ pub fn run() -> Result<()> {
             }
         }
     }
+}
+
+fn install_ctrlc_handler() -> Result<()> {
+    ctrlc::set_handler(|| {
+        eprintln!("received Ctrl-C, exiting");
+        process::exit(130);
+    })?;
+    Ok(())
 }
 
 fn cmd_config(args: ConfigArgs) -> Result<()> {
