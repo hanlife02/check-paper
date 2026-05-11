@@ -34,6 +34,42 @@ impl<'a> Answerer<'a> {
         }
         Ok(first)
     }
+
+    pub async fn answer_stream<F>(
+        &self,
+        author: &str,
+        question: &str,
+        on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let profiles = self.storage.search_profiles(author, question, 8)?;
+        let mut chunks = Vec::new();
+        if should_use_source_chunks(question, profiles.len()) {
+            chunks = self.storage.search_chunks(author, question, 8)?;
+        }
+
+        let first = self
+            .llm
+            .chat_stream(
+                qa_messages(question, &profiles, &chunks),
+                0.2,
+                2200,
+                on_delta,
+            )
+            .await?;
+        if signals_insufficient(&first) && chunks.is_empty() {
+            chunks = self.storage.search_chunks(author, question, 10)?;
+            return self
+                .llm
+                .chat_stream(qa_messages(question, &profiles, &chunks), 0.2, 2600, |_| {
+                    Ok(())
+                })
+                .await;
+        }
+        Ok(first)
+    }
 }
 
 fn signals_insufficient(answer: &str) -> bool {

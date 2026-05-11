@@ -1,10 +1,10 @@
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use reqwest::Proxy;
-use reqwest::blocking::{Client, ClientBuilder};
+use reqwest::{Client, ClientBuilder, Proxy};
 use serde::Deserialize;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::time::{Instant, sleep};
 
 use super::handlers::BotHandlers;
 
@@ -12,6 +12,9 @@ const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const TELEGRAM_REQUEST_TIMEOUT_SECS: u64 = TELEGRAM_POLL_TIMEOUT_SECS + 20;
 const TELEGRAM_POLL_RETRY_DELAY_SECS: u64 = 3;
 const TELEGRAM_MESSAGE_PREVIEW_CHARS: usize = 80;
+const TELEGRAM_MAX_MESSAGE_CHARS: usize = 3900;
+const TELEGRAM_STREAM_EDIT_INTERVAL_MS: u64 = 1100;
+const TELEGRAM_STREAM_PLACEHOLDER: &str = "处理中...";
 
 pub struct TelegramBot<'a> {
     token: String,
@@ -36,7 +39,14 @@ impl<'a> TelegramBot<'a> {
     }
 
     pub fn run_polling(&self) -> Result<()> {
-        let bot_username = self.get_me()?.username;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(self.run_polling_async())
+    }
+
+    async fn run_polling_async(&self) -> Result<()> {
+        let bot_username = self.get_me().await?.username;
         eprintln!(
             "Telegram bot started as {}; allowed chats: {}",
             format_bot_username(bot_username.as_deref()),
@@ -44,11 +54,11 @@ impl<'a> TelegramBot<'a> {
         );
         let mut offset = 0i64;
         loop {
-            let updates = match self.get_updates(offset) {
+            let updates = match self.get_updates(offset).await {
                 Ok(updates) => updates,
                 Err(err) if is_recoverable_poll_error(&err) => {
                     eprintln!("Telegram polling temporarily failed: {err}");
-                    thread::sleep(Duration::from_secs(TELEGRAM_POLL_RETRY_DELAY_SECS));
+                    sleep(Duration::from_secs(TELEGRAM_POLL_RETRY_DELAY_SECS)).await;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -77,14 +87,58 @@ impl<'a> TelegramBot<'a> {
                     continue;
                 }
                 let text = strip_bot_mention(&text, bot_username.as_deref());
-                let reply = self
-                    .handlers
-                    .handle_text(&text)
-                    .unwrap_or_else(|err| format!("处理失败：{err}"));
-                self.send_message(message.chat.id, &reply)?;
+                if should_stream_text(&text) {
+                    self.send_streaming_reply(message.chat.id, &text).await?;
+                } else {
+                    let reply = self
+                        .handlers
+                        .handle_text(&text)
+                        .unwrap_or_else(|err| format!("处理失败：{err}"));
+                    self.send_message(message.chat.id, &reply).await?;
+                }
             }
-            thread::sleep(Duration::from_millis(1000));
+            sleep(Duration::from_millis(1000)).await;
         }
+    }
+
+    async fn send_streaming_reply(&self, chat_id: i64, text: &str) -> Result<()> {
+        let placeholder = self
+            .send_message(chat_id, TELEGRAM_STREAM_PLACEHOLDER)
+            .await?;
+        let editor = TelegramMessageEditor {
+            token: self.token.clone(),
+            http: self.http.clone(),
+            chat_id,
+            message_id: placeholder.message_id,
+        };
+        let (tx, rx) = unbounded_channel();
+        let edit_task = tokio::spawn(stream_message_updates(editor.clone(), rx));
+        let stream_tx = tx.clone();
+        let reply = self
+            .handlers
+            .handle_text_stream(text, move |delta| {
+                let _ = stream_tx.send(delta.to_string());
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|err| format!("处理失败：{err}"));
+        drop(tx);
+
+        let edit_state = match edit_task.await {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!("Telegram stream edit task failed: {err}");
+                StreamEditState::default()
+            }
+        };
+        let final_text = telegram_message_text(&reply);
+        if final_text != edit_state.last_sent {
+            if let Err(err) = editor.edit(&final_text).await {
+                eprintln!("Telegram final edit failed, sending a new message instead: {err}");
+                self.send_message(chat_id, &final_text).await?;
+            }
+        }
+        Ok(())
     }
 
     fn skip_reason(
@@ -110,17 +164,19 @@ impl<'a> TelegramBot<'a> {
         Some("group message must mention this bot or use /start, /profile, or /ask")
     }
 
-    fn get_me(&self) -> Result<User> {
+    async fn get_me(&self) -> Result<User> {
         let response: TelegramResponse<User> = self
             .http
             .get(format!("https://api.telegram.org/bot{}/getMe", self.token))
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .json()?;
+            .json()
+            .await?;
         Ok(response.result)
     }
 
-    fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
+    async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
         let response: TelegramResponse<Vec<Update>> = self
             .http
             .get(format!(
@@ -131,27 +187,32 @@ impl<'a> TelegramBot<'a> {
                 ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
                 ("offset", offset.to_string()),
             ])
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .json()?;
+            .json()
+            .await?;
         Ok(response.result)
     }
 
-    fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
-        let truncated: String = text.chars().take(3900).collect();
-        self.http
+    async fn send_message(&self, chat_id: i64, text: &str) -> Result<SentMessage> {
+        let response: TelegramResponse<SentMessage> = self
+            .http
             .post(format!(
                 "https://api.telegram.org/bot{}/sendMessage",
                 self.token
             ))
             .form(&[
                 ("chat_id", chat_id.to_string()),
-                ("text", truncated),
+                ("text", telegram_message_text(text)),
                 ("disable_web_page_preview", "true".to_string()),
             ])
-            .send()?
-            .error_for_status()?;
-        Ok(())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(response.result)
     }
 }
 
@@ -162,6 +223,97 @@ fn http_client(proxy: Option<&str>) -> Result<Client> {
         builder = builder.proxy(Proxy::all(proxy)?);
     }
     Ok(builder.build()?)
+}
+
+#[derive(Clone)]
+struct TelegramMessageEditor {
+    token: String,
+    http: Client,
+    chat_id: i64,
+    message_id: i64,
+}
+
+impl TelegramMessageEditor {
+    async fn edit(&self, text: &str) -> Result<()> {
+        self.http
+            .post(format!(
+                "https://api.telegram.org/bot{}/editMessageText",
+                self.token
+            ))
+            .form(&[
+                ("chat_id", self.chat_id.to_string()),
+                ("message_id", self.message_id.to_string()),
+                ("text", telegram_message_text(text)),
+                ("disable_web_page_preview", "true".to_string()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct StreamEditState {
+    buffer: String,
+    last_sent: String,
+}
+
+impl StreamEditState {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            last_sent: TELEGRAM_STREAM_PLACEHOLDER.to_string(),
+        }
+    }
+}
+
+async fn stream_message_updates(
+    editor: TelegramMessageEditor,
+    mut rx: UnboundedReceiver<String>,
+) -> StreamEditState {
+    let mut state = StreamEditState::new();
+    let mut next_edit_at = Instant::now();
+    while let Some(delta) = rx.recv().await {
+        state.buffer.push_str(&delta);
+        if Instant::now() < next_edit_at {
+            continue;
+        }
+
+        let text = telegram_message_text(&state.buffer);
+        if text != state.last_sent {
+            if let Err(err) = editor.edit(&text).await {
+                eprintln!("Telegram stream edit failed: {err}");
+            } else {
+                state.last_sent = text;
+            }
+        }
+        next_edit_at = Instant::now() + Duration::from_millis(TELEGRAM_STREAM_EDIT_INTERVAL_MS);
+    }
+
+    let text = telegram_message_text(&state.buffer);
+    if !text.is_empty() && text != state.last_sent {
+        if let Err(err) = editor.edit(&text).await {
+            eprintln!("Telegram stream edit failed: {err}");
+        } else {
+            state.last_sent = text;
+        }
+    }
+    state
+}
+
+fn should_stream_text(text: &str) -> bool {
+    let stripped = text.trim();
+    !stripped.starts_with("/start") && !stripped.starts_with("/profile")
+}
+
+fn telegram_message_text(text: &str) -> String {
+    let truncated: String = text.chars().take(TELEGRAM_MAX_MESSAGE_CHARS).collect();
+    if truncated.trim().is_empty() {
+        TELEGRAM_STREAM_PLACEHOLDER.to_string()
+    } else {
+        truncated
+    }
 }
 
 fn is_recoverable_poll_error(error: &anyhow::Error) -> bool {
@@ -220,6 +372,11 @@ struct Update {
 struct Message {
     chat: Chat,
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SentMessage {
+    message_id: i64,
 }
 
 #[derive(Deserialize)]

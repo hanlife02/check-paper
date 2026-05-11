@@ -50,6 +50,41 @@ impl<'a> BotHandlers<'a> {
         self.answerer.answer(author, stripped)
     }
 
+    pub async fn handle_text_stream<F>(&self, text: &str, on_delta: F) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let stripped = text.trim();
+        if stripped.starts_with("/start") {
+            return Ok(start_message());
+        }
+        if stripped.starts_with("/profile") {
+            let author = stripped.trim_start_matches("/profile").trim();
+            let author = if author.is_empty() {
+                self.default_author.as_deref()
+            } else {
+                Some(author)
+            };
+            return self.profile(author);
+        }
+        if stripped.starts_with("/ask") {
+            let body = stripped.trim_start_matches("/ask").trim();
+            let (author, question) = self.parse_author_question(body)?;
+            return self
+                .answerer
+                .answer_stream(&author, &question, on_delta)
+                .await;
+        }
+        let Some(author) = self.default_author.as_deref() else {
+            return Ok(
+                "请先设置 CHECK_PAPER_DEFAULT_AUTHOR，或使用 `/ask 作者 | 问题`。".to_string(),
+            );
+        };
+        self.answerer
+            .answer_stream(author, stripped, on_delta)
+            .await
+    }
+
     fn profile(&self, author: Option<&str>) -> Result<String> {
         let Some(author) = author else {
             return Ok("请指定作者，例如 `/profile Ruqiang ZOU`。".to_string());
