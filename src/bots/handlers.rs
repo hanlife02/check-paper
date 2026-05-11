@@ -1,29 +1,34 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::qa::answerer::Answerer;
 use crate::storage::Storage;
+use crate::understanding::llm::OpenAiCompatibleClient;
 
-pub struct BotHandlers<'a> {
-    storage: &'a Storage,
-    answerer: Answerer<'a>,
+#[derive(Clone)]
+pub struct BotHandlers {
+    db_path: PathBuf,
+    llm: OpenAiCompatibleClient,
     default_author: Option<String>,
 }
 
-impl<'a> BotHandlers<'a> {
+impl BotHandlers {
     pub fn new(
-        storage: &'a Storage,
-        answerer: Answerer<'a>,
+        db_path: PathBuf,
+        llm: OpenAiCompatibleClient,
         default_author: Option<String>,
     ) -> Self {
         Self {
-            storage,
-            answerer,
+            db_path,
+            llm,
             default_author,
         }
     }
 
     pub fn handle_text(&self, text: &str) -> Result<String> {
+        let storage = Storage::open(&self.db_path)?;
+        let answerer = Answerer::new(&storage, self.llm.clone());
         let stripped = text.trim();
         if stripped.starts_with("/start") {
             return Ok(start_message());
@@ -35,25 +40,48 @@ impl<'a> BotHandlers<'a> {
             } else {
                 Some(author)
             };
-            return self.profile(author);
+            return self.profile(&storage, author);
+        }
+        if stripped.starts_with("/sources") {
+            let author = stripped.trim_start_matches("/sources").trim();
+            let author = if author.is_empty() {
+                self.default_author.as_deref()
+            } else {
+                Some(author)
+            };
+            return self.sources(&storage, author);
+        }
+        if stripped.starts_with("/status") {
+            let author = stripped.trim_start_matches("/status").trim();
+            let author = if author.is_empty() {
+                self.default_author.as_deref()
+            } else {
+                Some(author)
+            };
+            return self.status(&storage, author);
+        }
+        if stripped.starts_with("/cancel") {
+            return Ok("当前没有可取消的回答。".to_string());
         }
         if stripped.starts_with("/ask") {
             let body = stripped.trim_start_matches("/ask").trim();
             let (author, question) = self.parse_author_question(body)?;
-            return self.answerer.answer(&author, &question);
+            return answerer.answer(&author, &question);
         }
         let Some(author) = self.default_author.as_deref() else {
             return Ok(
                 "请先设置 CHECK_PAPER_DEFAULT_AUTHOR，或使用 `/ask 作者 | 问题`。".to_string(),
             );
         };
-        self.answerer.answer(author, stripped)
+        answerer.answer(author, stripped)
     }
 
     pub async fn handle_text_stream<F>(&self, text: &str, on_delta: F) -> Result<String>
     where
         F: FnMut(&str) -> Result<()>,
     {
+        let storage = Storage::open(&self.db_path)?;
+        let answerer = Answerer::new(&storage, self.llm.clone());
         let stripped = text.trim();
         if stripped.starts_with("/start") {
             return Ok(start_message());
@@ -65,38 +93,69 @@ impl<'a> BotHandlers<'a> {
             } else {
                 Some(author)
             };
-            return self.profile(author);
+            return self.profile(&storage, author);
+        }
+        if stripped.starts_with("/sources") {
+            let author = stripped.trim_start_matches("/sources").trim();
+            let author = if author.is_empty() {
+                self.default_author.as_deref()
+            } else {
+                Some(author)
+            };
+            return self.sources(&storage, author);
+        }
+        if stripped.starts_with("/status") {
+            let author = stripped.trim_start_matches("/status").trim();
+            let author = if author.is_empty() {
+                self.default_author.as_deref()
+            } else {
+                Some(author)
+            };
+            return self.status(&storage, author);
+        }
+        if stripped.starts_with("/cancel") {
+            return Ok("当前没有可取消的回答。".to_string());
         }
         if stripped.starts_with("/ask") {
             let body = stripped.trim_start_matches("/ask").trim();
             let (author, question) = self.parse_author_question(body)?;
-            return self
-                .answerer
-                .answer_stream(&author, &question, on_delta)
-                .await;
+            return answerer.answer_stream(&author, &question, on_delta).await;
         }
         let Some(author) = self.default_author.as_deref() else {
             return Ok(
                 "请先设置 CHECK_PAPER_DEFAULT_AUTHOR，或使用 `/ask 作者 | 问题`。".to_string(),
             );
         };
-        self.answerer
-            .answer_stream(author, stripped, on_delta)
-            .await
+        answerer.answer_stream(author, stripped, on_delta).await
     }
 
-    fn profile(&self, author: Option<&str>) -> Result<String> {
+    fn profile(&self, storage: &Storage, author: Option<&str>) -> Result<String> {
         let Some(author) = author else {
             return Ok("请指定作者，例如 `/profile Ruqiang ZOU`。".to_string());
         };
-        if let Some(profile) = self.storage.get_author_profile(author)? {
+        if let Some(profile) = storage.get_author_profile(author)? {
             Ok(format_profile(&profile))
         } else {
-            let count = self.storage.count_papers(Some(author))?;
+            let count = storage.count_papers(Some(author))?;
             Ok(format!(
                 "还没有作者画像。当前已入库 {count} 篇论文；请先运行 analyze 或 sync。"
             ))
         }
+    }
+
+    fn sources(&self, storage: &Storage, author: Option<&str>) -> Result<String> {
+        let Some(answer) = storage.latest_qa_answer(author)? else {
+            return Ok("还没有可显示的上一轮引用。".to_string());
+        };
+        Ok(format_sources(&answer))
+    }
+
+    fn status(&self, storage: &Storage, author: Option<&str>) -> Result<String> {
+        let status = storage.library_status(author)?;
+        Ok(format!(
+            "论文数：{}\n已分析：{}\n失败任务：{}",
+            status.papers, status.analyzed, status.failed_jobs
+        ))
     }
 
     fn parse_author_question(&self, body: &str) -> Result<(String, String)> {
@@ -120,7 +179,31 @@ impl<'a> BotHandlers<'a> {
 }
 
 fn start_message() -> String {
-    "check-paper 已启动。\n用法：\n/profile\n/ask 你的问题\n/ask Ruqiang ZOU | 你的问题".to_string()
+    "check-paper 已启动。\n用法：\n/profile\n/status\n/sources\n/cancel\n/ask 你的问题\n/ask Ruqiang ZOU | 你的问题".to_string()
+}
+
+fn format_sources(answer: &Value) -> String {
+    let Some(evidence) = answer.get("evidence").and_then(Value::as_array) else {
+        return "上一轮回答没有结构化 evidence。".to_string();
+    };
+    if evidence.is_empty() {
+        return "上一轮回答没有引用来源。".to_string();
+    }
+    let mut lines = vec!["上一轮依据：".to_string()];
+    for (index, item) in evidence.iter().enumerate() {
+        lines.push(format!(
+            "[{}] {} {} {} section={} chunk={}",
+            index + 1,
+            item.get("year").and_then(Value::as_str).unwrap_or(""),
+            item.get("title").and_then(Value::as_str).unwrap_or(""),
+            item.get("doi").and_then(Value::as_str).unwrap_or(""),
+            item.get("section").and_then(Value::as_str).unwrap_or(""),
+            item.get("chunk_id")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
 }
 
 fn format_profile(profile: &Value) -> String {
@@ -158,5 +241,38 @@ fn format_profile(profile: &Value) -> String {
     } else {
         let text = serde_json::to_string_pretty(profile).unwrap_or_else(|_| profile.to_string());
         text.chars().take(3500).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::format_sources;
+
+    #[test]
+    fn formats_structured_sources() {
+        let text = format_sources(&json!({
+            "answer": "ok",
+            "evidence": [{
+                "paper_key": "Alice/paper-a",
+                "title": "A Paper",
+                "doi": "10.1/test",
+                "year": "2024",
+                "chunk_id": 7,
+                "section": "Methods"
+            }]
+        }));
+
+        assert!(text.contains("上一轮依据："));
+        assert!(text.contains("[1] 2024 A Paper 10.1/test section=Methods chunk=7"));
+    }
+
+    #[test]
+    fn explains_missing_structured_sources() {
+        assert_eq!(
+            format_sources(&json!({ "answer": "plain" })),
+            "上一轮回答没有结构化 evidence。"
+        );
     }
 }

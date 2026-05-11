@@ -1,0 +1,142 @@
+[
+  {
+    "author": "Alice",
+    "question": "paper-a 的核心方法是什么？",
+    "must_cite": ["Alice/paper-a"],
+    "must_include": ["solvent screening"],
+    "must_not_include": ["photovoltaic"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-a 报告了什么实验结果？",
+    "must_cite": ["Alice/paper-a"],
+    "must_include": ["82% conversion"],
+    "must_not_include": ["toxicity"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-a 的局限是什么？",
+    "must_cite": ["Alice/paper-a"],
+    "must_include": ["small batch"],
+    "must_not_include": ["clinical trial"]
+  },
+  {
+    "author": "Alice",
+    "question": "What dataset does paper-a use?",
+    "must_cite": ["Alice/paper-a"],
+    "must_include": ["40 reaction records"],
+    "must_not_include": ["image dataset"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-b 的方法细节是什么？",
+    "must_cite": ["Alice/paper-b"],
+    "must_include": ["in situ infrared"],
+    "must_not_include": ["solvent screening"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-b 的关键机制是什么？",
+    "must_cite": ["Alice/paper-b"],
+    "must_include": ["oxygen vacancy"],
+    "must_not_include": ["small batch"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-b 中使用了什么指标？",
+    "must_cite": ["Alice/paper-b"],
+    "must_include": ["turnover frequency"],
+    "must_not_include": ["F1 score"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-b 是否比较了温度条件？",
+    "must_cite": ["Alice/paper-b"],
+    "must_include": ["120 C"],
+    "must_not_include": ["room temperature battery"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-c 的数据集是什么？",
+    "must_cite": ["Alice/paper-c"],
+    "must_include": ["500 adsorption isotherms"],
+    "must_not_include": ["40 reaction records"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-c 的模型方法是什么？",
+    "must_cite": ["Alice/paper-c"],
+    "must_include": ["graph neural network"],
+    "must_not_include": ["in situ infrared"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-c 的指标是多少？",
+    "must_cite": ["Alice/paper-c"],
+    "must_include": ["MAE of 0.12"],
+    "must_not_include": ["82% conversion"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-c 的局限是什么？",
+    "must_cite": ["Alice/paper-c"],
+    "must_include": ["missing humidity effects"],
+    "must_not_include": ["oxygen vacancy"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-d 研究了什么实验条件？",
+    "must_cite": ["Alice/paper-d"],
+    "must_include": ["pH 9 buffer"],
+    "must_not_include": ["500 adsorption isotherms"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-d 的方法关键词是什么？",
+    "must_cite": ["Alice/paper-d"],
+    "must_include": ["electrochemical impedance"],
+    "must_not_include": ["graph neural network"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-d 的结论是什么？",
+    "must_cite": ["Alice/paper-d"],
+    "must_include": ["lower charge transfer resistance"],
+    "must_not_include": ["oxygen vacancy"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-d 缺少什么证据？",
+    "must_cite": ["Alice/paper-d"],
+    "must_include": ["long term cycling"],
+    "must_not_include": ["clinical trial"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-e 比较了哪些论文？",
+    "must_cite": ["Alice/paper-e"],
+    "must_include": ["meta analysis"],
+    "must_not_include": ["pH 9 buffer"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-e 的统计方法是什么？",
+    "must_cite": ["Alice/paper-e"],
+    "must_include": ["random effects model"],
+    "must_not_include": ["electrochemical impedance"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-e 的主要结果是什么？",
+    "must_cite": ["Alice/paper-e"],
+    "must_include": ["15% median improvement"],
+    "must_not_include": ["MAE of 0.12"]
+  },
+  {
+    "author": "Alice",
+    "question": "paper-e 的证据不足点是什么？",
+    "must_cite": ["Alice/paper-e"],
+    "must_include": ["publication bias"],
+    "must_not_include": ["small batch reactor"]
+  }
+]

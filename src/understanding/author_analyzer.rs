@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use super::json_utils::parse_json_object;
 use super::llm::OpenAiCompatibleClient;
-use super::prompts::author_profile_messages;
+use super::prompts::{author_profile_messages, author_profile_repair_messages};
 
 pub fn build_author_profile(
     author: &str,
@@ -31,7 +31,51 @@ pub fn build_author_profile(
             .entry("keyword_overview")
             .or_insert(deterministic["keyword_overview"].clone());
     }
+    if let Err(error) = validate_author_profile(author, &profile) {
+        let repaired = llm.chat(
+            author_profile_repair_messages(author, &content, &error.to_string()),
+            0.0,
+            2400,
+        )?;
+        profile = parse_json_object(&repaired);
+        if let Some(object) = profile.as_object_mut() {
+            object.entry("author").or_insert(author.into());
+            object
+                .entry("total_profiled_papers")
+                .or_insert((profiles.len() as u64).into());
+            object
+                .entry("keyword_overview")
+                .or_insert(deterministic["keyword_overview"].clone());
+        }
+        validate_author_profile(author, &profile)?;
+    }
     Ok(profile)
+}
+
+fn validate_author_profile(author: &str, profile: &Value) -> Result<()> {
+    let actual_author = profile
+        .get("author")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("AuthorProfileV1 missing author"))?;
+    if actual_author.trim().is_empty() {
+        return Err(anyhow!("AuthorProfileV1 author is empty"));
+    }
+    if actual_author != author {
+        return Err(anyhow!(
+            "AuthorProfileV1 author mismatch: expected {author}, got {actual_author}"
+        ));
+    }
+    let has_scope = profile
+        .get("answer_scope")
+        .or_else(|| profile.get("keyword_overview"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    if !has_scope {
+        return Err(anyhow!(
+            "AuthorProfileV1 missing non-empty answer_scope or keyword_overview"
+        ));
+    }
+    Ok(())
 }
 
 fn deterministic_profile(author: &str, profiles: &[Value]) -> Value {
@@ -100,4 +144,28 @@ fn compact_profile(profile: &Value) -> Value {
         object.insert(target.to_string(), Value::Array(values));
     }
     serde_json::to_value(object).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::validate_author_profile;
+
+    #[test]
+    fn validates_author_profile_v1_minimum_shape() {
+        validate_author_profile(
+            "Alice",
+            &json!({
+                "author": "Alice",
+                "answer_scope": ["MOF catalysis"]
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_author_profile_without_scope() {
+        assert!(validate_author_profile("Alice", &json!({ "author": "Alice" })).is_err());
+    }
 }

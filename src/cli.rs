@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::bots::handlers::BotHandlers;
 use crate::bots::telegram_bot::TelegramBot;
 use crate::config::{Settings, config_path, load_config, redacted_config, save_config};
+use crate::eval::run_golden_eval;
 use crate::papers::loader::load_paper;
 use crate::papers::scanner::scan_paper_dirs;
 use crate::qa::answerer::Answerer;
@@ -18,7 +19,7 @@ use crate::retrieval::chunker::chunk_paper;
 use crate::storage::Storage;
 use crate::understanding::author_analyzer::build_author_profile;
 use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
-use crate::understanding::paper_analyzer::analyze_paper;
+use crate::understanding::paper_analyzer::{analyze_paper, extract_section_facts};
 
 #[derive(Parser)]
 #[command(version, about = "Analyze local paper archives and answer questions.")]
@@ -43,6 +44,7 @@ enum Command {
     Analyze(AnalyzeArgs),
     Sync(AnalyzeArgs),
     Ask(AskArgs),
+    Eval(EvalArgs),
     Profile(AuthorArgs),
     ServeTelegram,
 }
@@ -101,6 +103,14 @@ struct AskArgs {
     question: Vec<String>,
 }
 
+#[derive(Args)]
+struct EvalArgs {
+    #[arg(long)]
+    fixture: std::path::PathBuf,
+    #[arg(long, default_value_t = 8)]
+    top_k: usize,
+}
+
 pub fn run() -> Result<()> {
     install_ctrlc_handler()?;
     let cli = Cli::parse();
@@ -133,6 +143,7 @@ pub fn run() -> Result<()> {
                     cmd_analyze(args, &settings)
                 }
                 Command::Ask(args) => cmd_ask(args, &settings),
+                Command::Eval(args) => cmd_eval(args, &settings),
                 Command::Profile(args) => cmd_profile(args, &settings),
                 Command::ServeTelegram => cmd_serve_telegram(&settings),
                 Command::Config(_) | Command::Llm { .. } | Command::Tg { .. } => unreachable!(),
@@ -472,13 +483,22 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
             paper.title()
         );
         let progress = paper_progress(message.clone());
+        storage.record_analysis_job(&paper.key(), "analyze", "running", None)?;
         match analyze_paper_with_retries(&paper, &llm, &progress, &message) {
             Ok(profile) => {
                 storage.save_paper_profile(&paper.key(), &paper.source_hash, &profile)?;
+                storage.save_paper_facts(&paper.key(), &extract_section_facts(&paper))?;
+                storage.record_analysis_job(&paper.key(), "analyze", "succeeded", None)?;
                 progress.finish_with_message(format!("{message} done"));
             }
             Err(err) => {
                 progress.finish_with_message(format!("{message} failed"));
+                storage.record_analysis_job(
+                    &paper.key(),
+                    "analyze",
+                    "failed",
+                    Some(&err.to_string()),
+                )?;
                 failures.push((paper.key(), err.to_string()));
             }
         }
@@ -548,6 +568,13 @@ fn cmd_ask(args: AskArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn cmd_eval(args: EvalArgs, settings: &Settings) -> Result<()> {
+    let storage = Storage::open(&settings.db_path)?;
+    let report = run_golden_eval(&storage, &args.fixture, args.top_k)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 fn cmd_profile(args: AuthorArgs, settings: &Settings) -> Result<()> {
     let author = resolve_author(args.author.as_deref(), settings)?;
     let storage = Storage::open(&settings.db_path)?;
@@ -566,9 +593,11 @@ fn cmd_serve_telegram(settings: &Settings) -> Result<()> {
         .telegram_bot_token
         .clone()
         .ok_or_else(|| anyhow!("missing TELEGRAM_BOT_TOKEN; run `ppc tg config`"))?;
-    let storage = Storage::open(&settings.db_path)?;
-    let answerer = Answerer::new(&storage, make_llm(settings)?);
-    let handlers = BotHandlers::new(&storage, answerer, settings.default_author.clone());
+    let handlers = BotHandlers::new(
+        settings.db_path.clone(),
+        make_llm(settings)?,
+        settings.default_author.clone(),
+    );
     TelegramBot::new(
         token,
         settings.telegram_chat_ids.clone(),

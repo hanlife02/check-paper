@@ -52,6 +52,10 @@ impl OpenAiCompatibleClient {
         })
     }
 
+    pub fn model_name(&self) -> &str {
+        &self.config.model
+    }
+
     pub fn chat(
         &self,
         messages: Vec<ChatMessage>,

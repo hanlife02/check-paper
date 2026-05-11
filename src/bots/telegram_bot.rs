@@ -1,11 +1,16 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, ClientBuilder, Proxy};
 use serde::Deserialize;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep};
 
+use super::dispatcher::{ChatDispatcher, DispatchAction};
 use super::handlers::BotHandlers;
 
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
@@ -15,26 +20,33 @@ const TELEGRAM_MESSAGE_PREVIEW_CHARS: usize = 80;
 const TELEGRAM_MAX_MESSAGE_CHARS: usize = 3900;
 const TELEGRAM_STREAM_EDIT_INTERVAL_MS: u64 = 1100;
 const TELEGRAM_STREAM_PLACEHOLDER: &str = "处理中...";
+const TELEGRAM_DEFAULT_429_BACKOFF_SECS: u64 = 3;
+const TELEGRAM_LLM_CONCURRENCY: usize = 2;
 
-pub struct TelegramBot<'a> {
+#[derive(Clone)]
+pub struct TelegramBot {
     token: String,
     allowed_chat_ids: Vec<i64>,
-    handlers: BotHandlers<'a>,
+    handlers: BotHandlers,
     http: Client,
+    cancelled_jobs: Arc<Mutex<HashSet<u64>>>,
+    llm_semaphore: Arc<Semaphore>,
 }
 
-impl<'a> TelegramBot<'a> {
+impl TelegramBot {
     pub fn new(
         token: String,
         allowed_chat_ids: Vec<i64>,
         proxy: Option<String>,
-        handlers: BotHandlers<'a>,
+        handlers: BotHandlers,
     ) -> Result<Self> {
         Ok(Self {
             token,
             allowed_chat_ids,
             handlers,
             http: http_client(proxy.as_deref())?,
+            cancelled_jobs: Arc::new(Mutex::new(HashSet::new())),
+            llm_semaphore: Arc::new(Semaphore::new(TELEGRAM_LLM_CONCURRENCY)),
         })
     }
 
@@ -42,7 +54,8 @@ impl<'a> TelegramBot<'a> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(self.run_polling_async())
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(self.run_polling_async()))
     }
 
     async fn run_polling_async(&self) -> Result<()> {
@@ -53,7 +66,14 @@ impl<'a> TelegramBot<'a> {
             format_allowed_chat_ids(&self.allowed_chat_ids)
         );
         let mut offset = 0i64;
+        let mut dispatcher = ChatDispatcher::default();
+        let (done_tx, mut done_rx) = unbounded_channel::<i64>();
         loop {
+            while let Ok(chat_id) = done_rx.try_recv() {
+                if let Some(action) = dispatcher.finish(chat_id) {
+                    self.apply_dispatch_action(action, done_tx.clone()).await?;
+                }
+            }
             let updates = match self.get_updates(offset).await {
                 Ok(updates) => updates,
                 Err(err) if is_recoverable_poll_error(&err) => {
@@ -87,21 +107,96 @@ impl<'a> TelegramBot<'a> {
                     continue;
                 }
                 let text = strip_bot_mention(&text, bot_username.as_deref());
-                if should_stream_text(&text) {
-                    self.send_streaming_reply(message.chat.id, &text).await?;
-                } else {
-                    let reply = self
-                        .handlers
-                        .handle_text(&text)
-                        .unwrap_or_else(|err| format!("处理失败：{err}"));
-                    self.send_message(message.chat.id, &reply).await?;
+                if text.trim().starts_with("/cancel") {
+                    match dispatcher.cancel(message.chat.id) {
+                        DispatchAction::Cancelled { active_job_id, .. } => {
+                            if let Some(job_id) = active_job_id {
+                                self.mark_job_cancelled(job_id);
+                            }
+                            self.send_message(message.chat.id, "已取消当前回答。")
+                                .await?;
+                        }
+                        DispatchAction::NothingToCancel { .. } => {
+                            self.send_message(message.chat.id, "当前没有可取消的回答。")
+                                .await?;
+                        }
+                        _ => {}
+                    }
+                    continue;
                 }
+                let action = dispatcher.submit(message.chat.id, text);
+                self.apply_dispatch_action(action, done_tx.clone()).await?;
             }
             sleep(Duration::from_millis(1000)).await;
         }
     }
 
-    async fn send_streaming_reply(&self, chat_id: i64, text: &str) -> Result<()> {
+    async fn apply_dispatch_action(
+        &self,
+        action: DispatchAction,
+        done_tx: UnboundedSender<i64>,
+    ) -> Result<()> {
+        match action {
+            DispatchAction::Start {
+                chat_id,
+                job_id,
+                text,
+            } => {
+                let bot = self.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = bot
+                        .process_message(chat_id, job_id, text, done_tx.clone())
+                        .await
+                    {
+                        eprintln!("Telegram message processing failed: {err}");
+                        let _ = done_tx.send(chat_id);
+                    }
+                });
+            }
+            DispatchAction::Queued { chat_id, queue_len } => {
+                self.send_message(chat_id, &format!("已排队，前面还有 {queue_len} 条。"))
+                    .await?;
+            }
+            DispatchAction::Cancelled {
+                chat_id,
+                active_job_id,
+            } => {
+                if let Some(job_id) = active_job_id {
+                    self.mark_job_cancelled(job_id);
+                }
+                self.send_message(chat_id, "已取消当前回答。").await?;
+            }
+            DispatchAction::NothingToCancel { chat_id } => {
+                self.send_message(chat_id, "当前没有可取消的回答。").await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_message(
+        &self,
+        chat_id: i64,
+        job_id: u64,
+        text: String,
+        done_tx: UnboundedSender<i64>,
+    ) -> Result<()> {
+        let _permit = self.llm_semaphore.clone().acquire_owned().await?;
+        if should_stream_text(&text) {
+            self.send_streaming_reply(chat_id, job_id, &text).await?;
+        } else {
+            let reply = self
+                .handlers
+                .handle_text(&text)
+                .unwrap_or_else(|err| format!("处理失败：{err}"));
+            if !self.is_job_cancelled(job_id) {
+                self.send_long_message(chat_id, &reply).await?;
+            }
+        }
+        let _ = done_tx.send(chat_id);
+        Ok(())
+    }
+
+    async fn send_streaming_reply(&self, chat_id: i64, job_id: u64, text: &str) -> Result<()> {
         let placeholder = self
             .send_message(chat_id, TELEGRAM_STREAM_PLACEHOLDER)
             .await?;
@@ -114,9 +209,16 @@ impl<'a> TelegramBot<'a> {
         let (tx, rx) = unbounded_channel();
         let edit_task = tokio::spawn(stream_message_updates(editor.clone(), rx));
         let stream_tx = tx.clone();
+        let cancelled_jobs = self.cancelled_jobs.clone();
         let reply = self
             .handlers
             .handle_text_stream(text, move |delta| {
+                if cancelled_jobs
+                    .lock()
+                    .is_ok_and(|cancelled| cancelled.contains(&job_id))
+                {
+                    return Err(anyhow!("cancelled"));
+                }
                 let _ = stream_tx.send(delta.to_string());
                 Ok(())
             })
@@ -131,14 +233,37 @@ impl<'a> TelegramBot<'a> {
                 StreamEditState::default()
             }
         };
+        if self.is_job_cancelled(job_id) {
+            return Ok(());
+        }
         let final_text = telegram_message_text(&reply);
         if final_text != edit_state.last_sent {
             if let Err(err) = editor.edit(&final_text).await {
                 eprintln!("Telegram final edit failed, sending a new message instead: {err}");
-                self.send_message(chat_id, &final_text).await?;
+                self.send_long_message(chat_id, &reply).await?;
+            }
+        } else {
+            let pages = telegram_message_pages(&reply);
+            for page in pages.into_iter().skip(1) {
+                if self.is_job_cancelled(job_id) {
+                    break;
+                }
+                self.send_message(chat_id, &page).await?;
             }
         }
         Ok(())
+    }
+
+    fn mark_job_cancelled(&self, job_id: u64) {
+        if let Ok(mut cancelled) = self.cancelled_jobs.lock() {
+            cancelled.insert(job_id);
+        }
+    }
+
+    fn is_job_cancelled(&self, job_id: u64) -> bool {
+        self.cancelled_jobs
+            .lock()
+            .is_ok_and(|cancelled| cancelled.contains(&job_id))
     }
 
     fn skip_reason(
@@ -196,23 +321,29 @@ impl<'a> TelegramBot<'a> {
     }
 
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<SentMessage> {
-        let response: TelegramResponse<SentMessage> = self
-            .http
-            .post(format!(
-                "https://api.telegram.org/bot{}/sendMessage",
-                self.token
-            ))
-            .form(&[
-                ("chat_id", chat_id.to_string()),
-                ("text", telegram_message_text(text)),
-                ("disable_web_page_preview", "true".to_string()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let request = || {
+            self.http
+                .post(format!(
+                    "https://api.telegram.org/bot{}/sendMessage",
+                    self.token
+                ))
+                .form(&[
+                    ("chat_id", chat_id.to_string()),
+                    ("text", telegram_message_text(text)),
+                    ("disable_web_page_preview", "true".to_string()),
+                ])
+        };
+        let response = send_with_telegram_backoff(request).await?;
+        let response: TelegramResponse<SentMessage> = response.json().await?;
         Ok(response.result)
+    }
+
+    async fn send_long_message(&self, chat_id: i64, text: &str) -> Result<()> {
+        for page in telegram_message_pages(text) {
+            self.send_message(chat_id, &page).await?;
+            sleep(Duration::from_millis(1050)).await;
+        }
+        Ok(())
     }
 }
 
@@ -235,22 +366,35 @@ struct TelegramMessageEditor {
 
 impl TelegramMessageEditor {
     async fn edit(&self, text: &str) -> Result<()> {
-        self.http
-            .post(format!(
-                "https://api.telegram.org/bot{}/editMessageText",
-                self.token
-            ))
-            .form(&[
-                ("chat_id", self.chat_id.to_string()),
-                ("message_id", self.message_id.to_string()),
-                ("text", telegram_message_text(text)),
-                ("disable_web_page_preview", "true".to_string()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?;
+        let request = || {
+            self.http
+                .post(format!(
+                    "https://api.telegram.org/bot{}/editMessageText",
+                    self.token
+                ))
+                .form(&[
+                    ("chat_id", self.chat_id.to_string()),
+                    ("message_id", self.message_id.to_string()),
+                    ("text", telegram_message_text(text)),
+                    ("disable_web_page_preview", "true".to_string()),
+                ])
+        };
+        send_with_telegram_backoff(request).await?;
         Ok(())
     }
+}
+
+async fn send_with_telegram_backoff<F>(request: F) -> Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let response = request().send().await?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let delay = telegram_retry_after(response.headers());
+        sleep(delay).await;
+        return Ok(request().send().await?.error_for_status()?);
+    }
+    Ok(response.error_for_status()?)
 }
 
 #[derive(Default)]
@@ -304,16 +448,66 @@ async fn stream_message_updates(
 
 fn should_stream_text(text: &str) -> bool {
     let stripped = text.trim();
-    !stripped.starts_with("/start") && !stripped.starts_with("/profile")
+    !stripped.starts_with("/start")
+        && !stripped.starts_with("/profile")
+        && !stripped.starts_with("/sources")
+        && !stripped.starts_with("/status")
+        && !stripped.starts_with("/cancel")
 }
 
 fn telegram_message_text(text: &str) -> String {
-    let truncated: String = text.chars().take(TELEGRAM_MAX_MESSAGE_CHARS).collect();
+    let truncated: String = first_message_page(text);
     if truncated.trim().is_empty() {
         TELEGRAM_STREAM_PLACEHOLDER.to_string()
     } else {
         truncated
     }
+}
+
+fn telegram_message_pages(text: &str) -> Vec<String> {
+    let mut pages = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let page = first_message_page(rest);
+        let page_len = page.chars().count();
+        if page_len == 0 {
+            break;
+        }
+        pages.push(page);
+        rest = trim_start_chars(rest, page_len).trim_start();
+    }
+    if pages.is_empty() {
+        pages.push(TELEGRAM_STREAM_PLACEHOLDER.to_string());
+    }
+    pages
+}
+
+fn first_message_page(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= TELEGRAM_MAX_MESSAGE_CHARS {
+        return trimmed.to_string();
+    }
+    let limited: String = trimmed.chars().take(TELEGRAM_MAX_MESSAGE_CHARS).collect();
+    if let Some(index) = limited.rfind("\n\n") {
+        if index > TELEGRAM_MAX_MESSAGE_CHARS / 2 {
+            return limited[..index].trim().to_string();
+        }
+    }
+    if let Some(index) = limited.rfind('\n') {
+        if index > TELEGRAM_MAX_MESSAGE_CHARS / 2 {
+            return limited[..index].trim().to_string();
+        }
+    }
+    limited.trim().to_string()
+}
+
+fn trim_start_chars(text: &str, count: usize) -> &str {
+    let byte_index = text
+        .char_indices()
+        .nth(count)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    &text[byte_index..]
 }
 
 fn is_recoverable_poll_error(error: &anyhow::Error) -> bool {
@@ -328,6 +522,15 @@ fn is_recoverable_poll_error(error: &anyhow::Error) -> bool {
     error.status().is_some_and(|status| {
         status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
     })
+}
+
+fn telegram_retry_after(headers: &HeaderMap) -> Duration {
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(TELEGRAM_DEFAULT_429_BACKOFF_SECS))
 }
 
 fn format_bot_username(bot_username: Option<&str>) -> String {
@@ -406,7 +609,7 @@ fn mentions_bot(text: &str, bot_username: &str) -> bool {
 fn is_untargeted_bot_command(text: &str) -> bool {
     matches!(
         text.split_whitespace().next(),
-        Some("/start" | "/profile" | "/ask")
+        Some("/start" | "/profile" | "/ask" | "/sources" | "/status" | "/cancel")
     )
 }
 
@@ -446,7 +649,11 @@ fn is_command_boundary(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_untargeted_bot_command, mentions_bot, strip_bot_mention};
+    use super::{
+        TELEGRAM_MAX_MESSAGE_CHARS, is_untargeted_bot_command, mentions_bot, should_stream_text,
+        strip_bot_mention, telegram_message_pages, telegram_retry_after,
+    };
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
     fn detects_plain_group_mention() {
@@ -474,6 +681,9 @@ mod tests {
     fn detects_untargeted_commands() {
         assert!(is_untargeted_bot_command("/ask 问题"));
         assert!(is_untargeted_bot_command("/profile"));
+        assert!(is_untargeted_bot_command("/sources"));
+        assert!(is_untargeted_bot_command("/status"));
+        assert!(is_untargeted_bot_command("/cancel"));
         assert!(!is_untargeted_bot_command("/ask@OtherBot 问题"));
         assert!(!is_untargeted_bot_command("普通问题"));
     }
@@ -488,5 +698,46 @@ mod tests {
             strip_bot_mention("这篇论文讲什么 @PaperCheckBot", Some("PaperCheckBot")),
             "这篇论文讲什么"
         );
+    }
+
+    #[test]
+    fn paginates_long_messages_without_truncating() {
+        let text = format!(
+            "{}\n\n{}",
+            "A".repeat(TELEGRAM_MAX_MESSAGE_CHARS - 10),
+            "B".repeat(50)
+        );
+        let pages = telegram_message_pages(&text);
+        assert_eq!(
+            pages.concat().chars().filter(|ch| *ch == 'A').count(),
+            TELEGRAM_MAX_MESSAGE_CHARS - 10
+        );
+        assert_eq!(pages.concat().chars().filter(|ch| *ch == 'B').count(), 50);
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.chars().count() <= TELEGRAM_MAX_MESSAGE_CHARS)
+        );
+    }
+
+    #[test]
+    fn does_not_stream_lightweight_commands() {
+        assert!(!should_stream_text("/sources"));
+        assert!(!should_stream_text("/status"));
+        assert!(!should_stream_text("/cancel"));
+        assert!(should_stream_text("/ask 问题"));
+    }
+
+    #[test]
+    fn parses_telegram_retry_after_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(telegram_retry_after(&headers).as_secs(), 7);
+        assert_eq!(telegram_retry_after(&HeaderMap::new()).as_secs(), 3);
+    }
+
+    #[test]
+    fn llm_concurrency_limit_has_small_default() {
+        assert_eq!(super::TELEGRAM_LLM_CONCURRENCY, 2);
     }
 }
