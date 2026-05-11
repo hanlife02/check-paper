@@ -56,6 +56,7 @@ struct ConfigArgs {
 #[derive(Subcommand)]
 enum LlmCommand {
     Config(LlmConfigArgs),
+    Check,
 }
 
 #[derive(Args)]
@@ -107,6 +108,10 @@ pub fn run() -> Result<()> {
         Command::Config(args) => cmd_config(args),
         Command::Llm { command } => match command {
             LlmCommand::Config(args) => cmd_llm_config(args),
+            LlmCommand::Check => {
+                let settings = Settings::from_sources();
+                cmd_llm_check(&settings)
+            }
         },
         Command::Tg { command } => match command {
             TgCommand::Config(args) => cmd_tg_config(args),
@@ -202,6 +207,7 @@ fn cmd_llm_config(args: LlmConfigArgs) -> Result<()> {
             "CHECK_PAPER_LLM_API_KEY",
             "CHECK_PAPER_LLM_MODEL",
             "CHECK_PAPER_LLM_TIMEOUT_SECS",
+            "CHECK_PAPER_LLM_TLS_BACKEND",
         ])?;
         return Ok(());
     }
@@ -252,9 +258,35 @@ fn cmd_llm_config(args: LlmConfigArgs) -> Result<()> {
             false,
         )?,
     );
+    updates.insert(
+        "CHECK_PAPER_LLM_TLS_BACKEND".to_string(),
+        prompt_value(
+            "tls-backend (rustls/native)",
+            current
+                .get("CHECK_PAPER_LLM_TLS_BACKEND")
+                .map(String::as_str)
+                .unwrap_or("rustls"),
+            false,
+        )?,
+    );
 
     let path = save_config(&updates, None)?;
     println!("saved LLM config to {}", path.display());
+    Ok(())
+}
+
+fn cmd_llm_check(settings: &Settings) -> Result<()> {
+    require_llm(settings)?;
+    let llm = make_llm(settings)?;
+    let reply = llm.chat(
+        vec![crate::understanding::llm::ChatMessage {
+            role: "user".to_string(),
+            content: "Reply with ok.".to_string(),
+        }],
+        0.0,
+        8,
+    )?;
+    println!("LLM check succeeded: {reply}");
     Ok(())
 }
 
@@ -574,5 +606,6 @@ fn make_llm(settings: &Settings) -> Result<OpenAiCompatibleClient> {
         model: settings.llm_model.clone(),
         proxy: settings.proxy.clone(),
         timeout_secs: settings.llm_timeout_secs,
+        tls_backend: settings.llm_tls_backend.clone(),
     })
 }

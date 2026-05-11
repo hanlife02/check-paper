@@ -18,6 +18,7 @@ pub struct Settings {
     pub llm_api_key: Option<String>,
     pub llm_model: String,
     pub llm_timeout_secs: u64,
+    pub llm_tls_backend: String,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_ids: Vec<i64>,
 }
@@ -45,6 +46,7 @@ impl Settings {
             llm_model: setting(&config, "CHECK_PAPER_LLM_MODEL", ""),
             llm_timeout_secs: parse_u64(&setting(&config, "CHECK_PAPER_LLM_TIMEOUT_SECS", "180"))
                 .unwrap_or(180),
+            llm_tls_backend: setting(&config, "CHECK_PAPER_LLM_TLS_BACKEND", "rustls"),
             telegram_bot_token: empty_to_none(setting(&config, "TELEGRAM_BOT_TOKEN", "")),
             telegram_chat_ids: parse_i64_list(&setting(&config, "TELEGRAM_CHAT_IDS", "")),
         }

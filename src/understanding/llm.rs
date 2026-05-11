@@ -15,6 +15,7 @@ pub struct LlmConfig {
     pub model: String,
     pub proxy: Option<String>,
     pub timeout_secs: u64,
+    pub tls_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +32,11 @@ pub struct OpenAiCompatibleClient {
 
 impl OpenAiCompatibleClient {
     pub fn new(config: LlmConfig) -> Result<Self> {
-        let http = http_client(config.proxy.as_deref(), config.timeout_secs)?;
+        let http = http_client(
+            config.proxy.as_deref(),
+            config.timeout_secs,
+            &config.tls_backend,
+        )?;
         Ok(Self { config, http })
     }
 
@@ -89,8 +94,17 @@ impl OpenAiCompatibleClient {
     }
 }
 
-fn http_client(proxy: Option<&str>, timeout_secs: u64) -> Result<Client> {
+fn http_client(proxy: Option<&str>, timeout_secs: u64, tls_backend: &str) -> Result<Client> {
     let mut builder = ClientBuilder::new().timeout(Duration::from_secs(timeout_secs));
+    builder = match tls_backend.trim().to_lowercase().as_str() {
+        "" | "rustls" => builder.use_rustls_tls(),
+        "native" | "native-tls" => builder.use_native_tls(),
+        other => {
+            return Err(anyhow!(
+                "invalid CHECK_PAPER_LLM_TLS_BACKEND `{other}`; expected `rustls` or `native`"
+            ));
+        }
+    };
     if let Some(proxy) = proxy {
         builder = builder.proxy(Proxy::all(proxy)?);
     }
