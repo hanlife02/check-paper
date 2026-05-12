@@ -5,6 +5,8 @@ pub struct Chunk {
     pub paper_key: String,
     pub chunk_index: usize,
     pub section: String,
+    pub section_kind: String,
+    pub caption_label: Option<String>,
     pub text: String,
 }
 
@@ -28,6 +30,8 @@ pub fn chunk_paper(paper: &Paper, max_chars: usize, overlap: usize) -> Vec<Chunk
                 paper_key: paper.key(),
                 chunk_index: chunks.len(),
                 section: section.title.clone(),
+                section_kind: section.section_kind().to_string(),
+                caption_label: section.caption_label(),
                 text: piece,
             });
         }
@@ -79,5 +83,31 @@ mod tests {
         let chunks = split_text(&"A".repeat(1000), 300, 50);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 300));
+    }
+
+    #[test]
+    fn carries_caption_metadata_into_chunks() {
+        let paper = Paper {
+            author: "Alice".to_string(),
+            paper_id: "paper-a".to_string(),
+            paper_dir: std::path::PathBuf::new(),
+            article_path: std::path::PathBuf::new(),
+            fetch_result_path: None,
+            source_hash: "hash".to_string(),
+            metadata: Default::default(),
+            fetch_result: serde_json::json!({}),
+            raw_body: String::new(),
+            clean_text: String::new(),
+            sections: vec![Section {
+                title: "Figure 2 Caption".to_string(),
+                level: 2,
+                content: "Figure 2: conversion trend".to_string(),
+            }],
+        };
+
+        let chunks = chunk_paper(&paper, 3200, 350);
+
+        assert_eq!(chunks[0].section_kind, "figure_caption");
+        assert_eq!(chunks[0].caption_label.as_deref(), Some("Figure 2"));
     }
 }

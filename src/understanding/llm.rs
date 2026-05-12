@@ -18,6 +18,8 @@ pub struct LlmConfig {
     pub proxy: Option<String>,
     pub timeout_secs: u64,
     pub tls_backend: String,
+    pub prompt_cost_per_1k: Option<f64>,
+    pub completion_cost_per_1k: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,19 @@ pub struct OpenAiCompatibleClient {
     config: LlmConfig,
     http: Client,
     async_http: AsyncClient,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LlmUsage {
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatCompletionOutput {
+    pub content: String,
+    pub usage: LlmUsage,
 }
 
 impl OpenAiCompatibleClient {
@@ -56,12 +71,31 @@ impl OpenAiCompatibleClient {
         &self.config.model
     }
 
+    pub fn estimate_cost_usd(&self, usage: &LlmUsage) -> Option<f64> {
+        let prompt_cost = self.config.prompt_cost_per_1k?;
+        let completion_cost = self.config.completion_cost_per_1k?;
+        let prompt_tokens = usage.prompt_tokens? as f64;
+        let completion_tokens = usage.completion_tokens? as f64;
+        Some(prompt_tokens / 1000.0 * prompt_cost + completion_tokens / 1000.0 * completion_cost)
+    }
+
     pub fn chat(
         &self,
         messages: Vec<ChatMessage>,
         temperature: f32,
         max_tokens: u32,
     ) -> Result<String> {
+        Ok(self
+            .chat_with_usage(messages, temperature, max_tokens)?
+            .content)
+    }
+
+    pub fn chat_with_usage(
+        &self,
+        messages: Vec<ChatMessage>,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<ChatCompletionOutput> {
         let api_key = self
             .config
             .api_key
@@ -101,12 +135,16 @@ impl OpenAiCompatibleClient {
                 preview_body(&body)
             )
         })?;
-        response
+        let content = response
             .choices
             .into_iter()
             .next()
             .map(|choice| choice.message.content)
-            .ok_or_else(|| anyhow!("LLM API returned no choices"))
+            .ok_or_else(|| anyhow!("LLM API returned no choices"))?;
+        Ok(ChatCompletionOutput {
+            content,
+            usage: response.usage.unwrap_or_default().into(),
+        })
     }
 
     pub async fn chat_stream<F>(
@@ -293,6 +331,14 @@ struct ChatCompletionStreamRequest {
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    usage: Option<ChatCompletionUsage>,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatCompletionUsage {
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +349,16 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatChoiceMessage {
     content: String,
+}
+
+impl From<ChatCompletionUsage> for LlmUsage {
+    fn from(value: ChatCompletionUsage) -> Self {
+        Self {
+            prompt_tokens: value.prompt_tokens,
+            completion_tokens: value.completion_tokens,
+            total_tokens: value.total_tokens,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -451,6 +507,8 @@ mod tests {
             proxy: None,
             timeout_secs: 5,
             tls_backend: "rustls".to_string(),
+            prompt_cost_per_1k: None,
+            completion_cost_per_1k: None,
         })
         .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -478,6 +536,43 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn chat_completion_captures_usage() {
+        let (base_url, handle) = start_json_mock_server(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+        );
+        let llm = OpenAiCompatibleClient::new(LlmConfig {
+            base_url,
+            api_key: Some("test-key".to_string()),
+            model: "test-model".to_string(),
+            proxy: None,
+            timeout_secs: 5,
+            tls_backend: "rustls".to_string(),
+            prompt_cost_per_1k: Some(0.01),
+            completion_cost_per_1k: Some(0.03),
+        })
+        .unwrap();
+
+        let output = llm
+            .chat_with_usage(
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                0.0,
+                8,
+            )
+            .unwrap();
+
+        assert_eq!(output.content, "ok");
+        assert_eq!(output.usage.prompt_tokens, Some(3));
+        assert_eq!(output.usage.completion_tokens, Some(2));
+        assert_eq!(output.usage.total_tokens, Some(5));
+        let cost = llm.estimate_cost_usd(&output.usage).unwrap();
+        assert!((cost - 0.00009).abs() < f64::EPSILON);
+        handle.join().unwrap();
+    }
+
     fn start_mock_server(body: &'static str) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -490,6 +585,25 @@ mod tests {
 
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn start_json_mock_server(body: &'static str) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("POST /chat/completions "));
+            assert!(request.contains("authorization: Bearer test-key"));
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );

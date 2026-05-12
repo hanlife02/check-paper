@@ -4,6 +4,7 @@ use serde_json::json;
 
 use crate::papers::models::Paper;
 use crate::retrieval::chunker::chunk_paper;
+use crate::schemas::paper_profile::PaperProfileV1;
 
 use super::json_utils::parse_json_object;
 use super::llm::OpenAiCompatibleClient;
@@ -13,9 +14,11 @@ pub fn analyze_paper(
     paper: &Paper,
     llm: &OpenAiCompatibleClient,
     max_chars: usize,
+    chunk_max_chars: usize,
+    chunk_overlap: usize,
 ) -> Result<Value> {
     let context = build_analysis_context(paper, max_chars);
-    let chunks = chunk_paper(paper, 3200, 350);
+    let chunks = chunk_paper(paper, chunk_max_chars, chunk_overlap);
     let content = llm.chat(
         paper_analysis_messages_with_chunks(paper, &context, &chunks),
         0.1,
@@ -30,6 +33,7 @@ pub fn analyze_paper(
         object
             .entry("source_hash")
             .or_insert(paper.source_hash.clone().into());
+        object.entry("repair_count").or_insert(0.into());
     }
     if let Err(error) = validate_paper_profile(&profile, chunks.len()) {
         let repaired = llm.chat(
@@ -46,6 +50,7 @@ pub fn analyze_paper(
             object
                 .entry("source_hash")
                 .or_insert(paper.source_hash.clone().into());
+            object.insert("repair_count".to_string(), 1.into());
         }
         validate_paper_profile(&profile, chunks.len())?;
     }
@@ -53,18 +58,10 @@ pub fn analyze_paper(
 }
 
 fn validate_paper_profile(profile: &Value, chunk_count: usize) -> Result<()> {
-    for field in ["paper_key", "title", "doi", "year", "one_sentence_summary"] {
-        if !profile
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return Err(anyhow::anyhow!("PaperProfileV1 missing non-empty {field}"));
-        }
-    }
-    validate_profile_evidence_chunks(profile, chunk_count)
+    PaperProfileV1::from_value(profile.clone())?.validate(chunk_count)
 }
 
+#[cfg(test)]
 fn validate_profile_evidence_chunks(profile: &Value, chunk_count: usize) -> Result<()> {
     for field in ["methods", "key_results", "limitations"] {
         let Some(items) = profile.get(field).and_then(Value::as_array) else {
@@ -121,16 +118,22 @@ pub fn build_analysis_context(paper: &Paper, max_chars: usize) -> String {
     take_chars(&selected.join("\n\n"), max_chars)
 }
 
-pub fn extract_section_facts(paper: &Paper) -> Vec<Value> {
-    let chunks = chunk_paper(paper, 3200, 350);
+pub fn extract_section_facts(
+    paper: &Paper,
+    chunk_max_chars: usize,
+    chunk_overlap: usize,
+) -> Vec<Value> {
+    let chunks = chunk_paper(paper, chunk_max_chars, chunk_overlap);
     chunks
         .iter()
         .filter_map(|chunk| {
-            let fact_type = section_fact_type(&chunk.section)?;
+            let fact_type = section_fact_type(&chunk.section, &chunk.section_kind)?;
             Some(json!({
                 "paper_key": chunk.paper_key,
                 "chunk_id": chunk.chunk_index,
                 "section": chunk.section,
+                "section_kind": chunk.section_kind,
+                "caption_label": chunk.caption_label,
                 "fact_type": fact_type,
                 "text": chunk.text,
             }))
@@ -138,7 +141,12 @@ pub fn extract_section_facts(paper: &Paper) -> Vec<Value> {
         .collect()
 }
 
-fn section_fact_type(section: &str) -> Option<&'static str> {
+fn section_fact_type(section: &str, section_kind: &str) -> Option<&'static str> {
+    match section_kind {
+        "figure_caption" => return Some("figure_caption"),
+        "table_caption" => return Some("table_caption"),
+        _ => {}
+    }
     let section = section.to_lowercase();
     if section.contains("method") || section.contains("experiment") {
         Some("method")
@@ -153,9 +161,18 @@ fn section_fact_type(section: &str) -> Option<&'static str> {
         Some("dataset")
     } else if section.contains("metric") {
         Some("metric")
+    } else if is_caption_section(&section, "figure") || section.starts_with("fig ") {
+        Some("figure_caption")
+    } else if is_caption_section(&section, "table") {
+        Some("table_caption")
     } else {
         None
     }
+}
+
+fn is_caption_section(section: &str, prefix: &str) -> bool {
+    (section.starts_with(prefix) && section.contains("caption"))
+        || section == format!("{prefix} captions")
 }
 
 fn tail_context(text: &str, max_chars: usize) -> Option<String> {
@@ -247,9 +264,19 @@ mod tests {
                     level: 2,
                     content: "result text".to_string(),
                 },
+                Section {
+                    title: "Figure 1 Caption".to_string(),
+                    level: 2,
+                    content: "Figure 1: conversion plot".to_string(),
+                },
+                Section {
+                    title: "Table S1 Caption".to_string(),
+                    level: 2,
+                    content: "Table S1: catalyst metrics".to_string(),
+                },
             ],
         };
-        let facts = extract_section_facts(&paper);
+        let facts = extract_section_facts(&paper, 3200, 350);
         let fact_types = facts
             .iter()
             .filter_map(|fact| fact.get("fact_type").and_then(serde_json::Value::as_str))
@@ -258,5 +285,7 @@ mod tests {
         assert!(fact_types.contains(&"method"));
         assert!(fact_types.contains(&"dataset"));
         assert!(fact_types.contains(&"result"));
+        assert!(fact_types.contains(&"figure_caption"));
+        assert!(fact_types.contains(&"table_caption"));
     }
 }

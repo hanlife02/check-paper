@@ -19,6 +19,19 @@ pub struct Settings {
     pub llm_model: String,
     pub llm_timeout_secs: u64,
     pub llm_tls_backend: String,
+    pub llm_prompt_cost_per_1k: Option<f64>,
+    pub llm_completion_cost_per_1k: Option<f64>,
+    pub embedding_provider: String,
+    pub embedding_base_url: String,
+    pub embedding_api_key: Option<String>,
+    pub embedding_model: String,
+    pub embedding_model_version: Option<String>,
+    pub embedding_timeout_secs: u64,
+    pub embedding_tls_backend: String,
+    pub embedding_batch_size: usize,
+    pub chunk_max_chars: usize,
+    pub chunk_overlap: usize,
+    pub chunker_version: String,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_ids: Vec<i64>,
 }
@@ -33,7 +46,7 @@ impl Settings {
                 "CHECK_PAPER_DB_PATH",
                 "data/check_paper.sqlite",
             )),
-            default_author: empty_to_none(setting(&config, "CHECK_PAPER_DEFAULT_AUTHOR", "root")),
+            default_author: empty_to_none(setting(&config, "CHECK_PAPER_DEFAULT_AUTHOR", "")),
             proxy: empty_to_none(setting(&config, "CHECK_PAPER_PROXY", "")),
             llm_base_url: setting(
                 &config,
@@ -47,6 +60,51 @@ impl Settings {
             llm_timeout_secs: parse_u64(&setting(&config, "CHECK_PAPER_LLM_TIMEOUT_SECS", "180"))
                 .unwrap_or(180),
             llm_tls_backend: setting(&config, "CHECK_PAPER_LLM_TLS_BACKEND", "rustls"),
+            llm_prompt_cost_per_1k: parse_f64(&setting(
+                &config,
+                "CHECK_PAPER_LLM_PROMPT_COST_PER_1K",
+                "",
+            )),
+            llm_completion_cost_per_1k: parse_f64(&setting(
+                &config,
+                "CHECK_PAPER_LLM_COMPLETION_COST_PER_1K",
+                "",
+            )),
+            embedding_provider: setting(&config, "CHECK_PAPER_EMBEDDING_PROVIDER", "disabled"),
+            embedding_base_url: setting(
+                &config,
+                "CHECK_PAPER_EMBEDDING_BASE_URL",
+                "https://api.openai.com/v1",
+            )
+            .trim_end_matches('/')
+            .to_string(),
+            embedding_api_key: empty_to_none(setting(&config, "CHECK_PAPER_EMBEDDING_API_KEY", "")),
+            embedding_model: setting(&config, "CHECK_PAPER_EMBEDDING_MODEL", ""),
+            embedding_model_version: empty_to_none(setting(
+                &config,
+                "CHECK_PAPER_EMBEDDING_MODEL_VERSION",
+                "",
+            )),
+            embedding_timeout_secs: parse_u64(&setting(
+                &config,
+                "CHECK_PAPER_EMBEDDING_TIMEOUT_SECS",
+                "180",
+            ))
+            .unwrap_or(180),
+            embedding_tls_backend: setting(&config, "CHECK_PAPER_EMBEDDING_TLS_BACKEND", "rustls"),
+            embedding_batch_size: parse_usize(&setting(
+                &config,
+                "CHECK_PAPER_EMBEDDING_BATCH_SIZE",
+                "64",
+            ))
+            .filter(|value| *value > 0)
+            .unwrap_or(64),
+            chunk_max_chars: parse_usize(&setting(&config, "CHECK_PAPER_CHUNK_MAX_CHARS", "3200"))
+                .filter(|value| *value > 0)
+                .unwrap_or(3200),
+            chunk_overlap: parse_usize(&setting(&config, "CHECK_PAPER_CHUNK_OVERLAP", "350"))
+                .unwrap_or(350),
+            chunker_version: setting(&config, "CHECK_PAPER_CHUNKER_VERSION", "section-char-v1"),
             telegram_bot_token: empty_to_none(setting(&config, "TELEGRAM_BOT_TOKEN", "")),
             telegram_chat_ids: parse_i64_list(&setting(&config, "TELEGRAM_CHAT_IDS", "")),
         }
@@ -159,6 +217,14 @@ fn parse_i64_list(value: &str) -> Vec<i64> {
 
 fn parse_u64(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
+}
+
+fn parse_usize(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok()
+}
+
+fn parse_f64(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok()
 }
 
 #[cfg(test)]

@@ -2,6 +2,28 @@ use std::collections::BTreeMap;
 
 use super::models::Section;
 
+pub const PARSER_VERSION: &str = "markdown-parser-v2";
+
+#[derive(Debug, Clone)]
+struct Caption {
+    label: String,
+    text: String,
+}
+
+impl Caption {
+    fn title(&self) -> String {
+        format!("{} Caption", self.label)
+    }
+
+    fn content(&self) -> String {
+        if self.text.is_empty() {
+            self.label.clone()
+        } else {
+            format!("{}: {}", self.label, self.text)
+        }
+    }
+}
+
 pub fn parse_frontmatter(markdown: &str) -> (BTreeMap<String, String>, String) {
     let mut lines = markdown.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -35,11 +57,19 @@ pub fn parse_frontmatter(markdown: &str) -> (BTreeMap<String, String>, String) {
 
 pub fn parse_sections(markdown: &str) -> Vec<Section> {
     let mut sections = Vec::new();
+    let mut figure_captions = Vec::new();
+    let mut table_captions = Vec::new();
     let mut current_title: Option<String> = None;
     let mut current_level = 1usize;
     let mut current_body: Vec<String> = Vec::new();
 
     for line in markdown.lines() {
+        let trimmed = line.trim();
+        if let Some(caption) = parse_figure_caption(trimmed) {
+            figure_captions.push(caption);
+        } else if let Some(caption) = parse_table_caption(trimmed) {
+            table_captions.push(caption);
+        }
         if let Some((level, title)) = parse_heading(line) {
             if let Some(title) = current_title.take() {
                 let content = current_body.join("\n").trim().to_string();
@@ -74,6 +104,21 @@ pub fn parse_sections(markdown: &str) -> Vec<Section> {
         });
     }
 
+    for caption in figure_captions {
+        sections.push(Section {
+            title: caption.title(),
+            level: 2,
+            content: caption.content(),
+        });
+    }
+    for caption in table_captions {
+        sections.push(Section {
+            title: caption.title(),
+            level: 2,
+            content: caption.content(),
+        });
+    }
+
     sections
         .into_iter()
         .filter(|section| !section.content.trim().is_empty())
@@ -94,7 +139,127 @@ fn parse_heading(line: &str) -> Option<(usize, &str)> {
     }
 }
 
+fn parse_figure_caption(line: &str) -> Option<Caption> {
+    parse_english_caption(line, "figure", "fig", "Figure").or_else(|| parse_cjk_caption(line, '图'))
+}
+
+fn parse_table_caption(line: &str) -> Option<Caption> {
+    parse_english_caption(line, "table", "table", "Table").or_else(|| parse_cjk_caption(line, '表'))
+}
+
+fn parse_english_caption(
+    line: &str,
+    long_prefix: &str,
+    short_prefix: &str,
+    canonical_prefix: &str,
+) -> Option<Caption> {
+    let line = normalize_caption_line(line);
+    let lower = line.to_lowercase();
+    let after_prefix = if starts_with_caption_prefix(&lower, &line, long_prefix) {
+        &line[long_prefix.len()..]
+    } else if short_prefix != long_prefix && starts_with_caption_prefix(&lower, &line, short_prefix)
+    {
+        &line[short_prefix.len()..]
+    } else {
+        return None;
+    };
+    let after_prefix = after_prefix.trim_start_matches('.').trim_start();
+    parse_caption_tail(after_prefix).map(|(label, text)| Caption {
+        label: format!("{canonical_prefix} {label}"),
+        text,
+    })
+}
+
+fn starts_with_caption_prefix(lower: &str, original: &str, prefix: &str) -> bool {
+    if !lower.starts_with(prefix) {
+        return false;
+    }
+    original[prefix.len()..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '.' || ch.is_whitespace() || ch.is_ascii_digit())
+}
+
+fn parse_cjk_caption(line: &str, marker: char) -> Option<Caption> {
+    let line = normalize_caption_line(line);
+    let after_marker = line.strip_prefix(marker)?.trim_start();
+    parse_caption_tail(after_marker).map(|(label, text)| Caption {
+        label: format!("{marker} {label}"),
+        text,
+    })
+}
+
+fn parse_caption_tail(value: &str) -> Option<(String, String)> {
+    let mut label_end = 0usize;
+    for (index, ch) in value.char_indices() {
+        if ch.is_alphanumeric() || ch == '-' {
+            label_end = index + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if label_end == 0 {
+        return None;
+    }
+    let label = value[..label_end].to_string();
+    if !label.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let text = value[label_end..]
+        .trim_start()
+        .trim_start_matches(|ch: char| matches!(ch, '.' | ':' | '-' | '|' | ')'))
+        .trim_start()
+        .to_string();
+    Some((label, text))
+}
+
+fn normalize_caption_line(value: &str) -> String {
+    strip_inline_noise(value)
+        .replace('\u{00a0}', " ")
+        .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | ' '))
+        .replace("**", "")
+        .replace("__", "")
+        .trim()
+        .to_string()
+}
+
 fn parse_simple_yaml(lines: &[String]) -> BTreeMap<String, String> {
+    parse_yaml_metadata(lines).unwrap_or_else(|| parse_line_based_metadata(lines))
+}
+
+fn parse_yaml_metadata(lines: &[String]) -> Option<BTreeMap<String, String>> {
+    let text = lines.join("\n");
+    let value: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+    let object = value.as_mapping()?;
+    let mut metadata = BTreeMap::new();
+    for (key, value) in object {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        metadata.insert(key.trim().to_string(), yaml_scalar_to_string(value));
+    }
+    Some(metadata)
+}
+
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::Null => String::new(),
+        serde_yaml::Value::Bool(value) => value.to_string(),
+        serde_yaml::Value::Number(value) => value.to_string(),
+        serde_yaml::Value::String(value) => value.clone(),
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .map(yaml_scalar_to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => serde_yaml::to_string(value)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+fn parse_line_based_metadata(lines: &[String]) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     for line in lines {
         let line = line.trim();
@@ -142,6 +307,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_yaml_frontmatter_sequences() {
+        let (metadata, _) =
+            parse_frontmatter("---\ntitle: A Paper\nauthors:\n  - Alice\n  - Bob\n---\nBody");
+        assert_eq!(metadata["title"], "A Paper");
+        assert_eq!(metadata["authors"], "Alice, Bob");
+    }
+
+    #[test]
     fn parses_sections() {
         let sections = parse_sections("# Title\nA\n\n## Abstract\nB");
         let titles: Vec<_> = sections
@@ -149,5 +322,45 @@ mod tests {
             .map(|section| section.title.as_str())
             .collect();
         assert_eq!(titles, vec!["Title", "Abstract"]);
+    }
+
+    #[test]
+    fn preserves_figure_and_table_captions_as_sections() {
+        let sections =
+            parse_sections("# Results\nFigure 1. Conversion trend.\nTable 2. Catalyst metrics.");
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Figure 1 Caption"
+                    && section.section_kind() == "figure_caption"
+                    && section.caption_label().as_deref() == Some("Figure 1")
+                    && section.content == "Figure 1: Conversion trend.")
+        );
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Table 2 Caption"
+                    && section.section_kind() == "table_caption"
+                    && section.caption_label().as_deref() == Some("Table 2")
+                    && section.content == "Table 2: Catalyst metrics.")
+        );
+    }
+
+    #[test]
+    fn extracts_compact_caption_labels() {
+        let sections = parse_sections("Fig.1| Fast conversion.\n**Table S1.** Catalyst metrics.");
+
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Figure 1 Caption"
+                    && section.content == "Figure 1: Fast conversion.")
+        );
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Table S1 Caption"
+                    && section.content == "Table S1: Catalyst metrics.")
+        );
     }
 }

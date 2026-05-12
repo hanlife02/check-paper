@@ -11,15 +11,22 @@ use std::time::Duration;
 use crate::bots::handlers::BotHandlers;
 use crate::bots::telegram_bot::TelegramBot;
 use crate::config::{Settings, config_path, load_config, redacted_config, save_config};
-use crate::eval::run_golden_eval;
 use crate::papers::loader::load_paper;
 use crate::papers::scanner::scan_paper_dirs;
-use crate::qa::answerer::Answerer;
 use crate::retrieval::chunker::chunk_paper;
+use crate::retrieval::embedding::{EmbeddingConfig, OpenAiCompatibleEmbeddingClient};
+use crate::schemas::paper_profile::PAPER_PROFILE_SCHEMA_VERSION;
+use crate::services::analysis::{AnalysisQueueOptions, AnalysisService};
+use crate::services::embedding::EmbeddingService;
+use crate::services::eval::EvalService;
+use crate::services::jobs::JobService;
+use crate::services::profile::{AuthorProfileLookup, AuthorProfileRebuild, ProfileService};
+use crate::services::qa::QaService;
+use crate::services::status::StatusService;
 use crate::storage::Storage;
-use crate::understanding::author_analyzer::build_author_profile;
 use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
 use crate::understanding::paper_analyzer::{analyze_paper, extract_section_facts};
+use crate::understanding::prompts::PAPER_PROFILE_PROMPT_VERSION;
 
 #[derive(Parser)]
 #[command(version, about = "Analyze local paper archives and answer questions.")]
@@ -30,85 +37,201 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Configure database path, default author, and proxy")]
     Config(ConfigArgs),
+    #[command(about = "Configure or check the OpenAI-compatible LLM")]
     Llm {
         #[command(subcommand)]
         command: LlmCommand,
     },
+    #[command(about = "Configure Telegram bot settings")]
     Tg {
         #[command(subcommand)]
         command: TgCommand,
     },
+    #[command(about = "List local paper directories")]
     Scan(AuthorArgs),
+    #[command(about = "Parse papers, chunk text, and update the database")]
     Ingest(AuthorArgs),
+    #[command(about = "Generate structured paper profiles with the LLM")]
     Analyze(AnalyzeArgs),
+    #[command(about = "Run ingest and analyze in one step")]
     Sync(AnalyzeArgs),
+    #[command(about = "Create or refresh chunk embeddings")]
+    Embed(EmbedArgs),
+    #[command(about = "Ask a question about an author's papers")]
     Ask(AskArgs),
+    #[command(about = "Run a golden-question retrieval/answer evaluation")]
     Eval(EvalArgs),
-    Profile(AuthorArgs),
+    #[command(about = "Inspect, retry, or cancel analysis jobs")]
+    Jobs(JobsArgs),
+    #[command(about = "Show QA or job logs")]
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
+    #[command(about = "Show library and job status")]
+    Status(AuthorArgs),
+    #[command(about = "Show or rebuild an author profile")]
+    Profile(ProfileArgs),
+    #[command(about = "Start the Telegram bot polling loop")]
     ServeTelegram,
 }
 
 #[derive(Args)]
 struct ConfigArgs {
-    #[arg(long)]
+    #[arg(long, help = "Print saved config values without prompting")]
     show: bool,
 }
 
 #[derive(Subcommand)]
 enum LlmCommand {
+    #[command(about = "Configure LLM endpoint, key, model, timeout, and costs")]
     Config(LlmConfigArgs),
+    #[command(about = "Send a small test request to the configured LLM")]
     Check,
 }
 
 #[derive(Args)]
 struct LlmConfigArgs {
-    #[arg(long)]
+    #[arg(long, help = "Print saved LLM config values without prompting")]
     show: bool,
 }
 
 #[derive(Subcommand)]
 enum TgCommand {
+    #[command(about = "Configure Telegram bot token and allowed chat IDs")]
     Config(TgConfigArgs),
 }
 
 #[derive(Args)]
 struct TgConfigArgs {
-    #[arg(long)]
+    #[arg(long, help = "Print saved Telegram config values without prompting")]
     show: bool,
 }
 
 #[derive(Args)]
 struct AuthorArgs {
-    #[arg(long)]
+    #[arg(long, help = "Author directory under the paper root")]
     author: Option<String>,
 }
 
 #[derive(Args, Clone)]
 struct AnalyzeArgs {
-    #[arg(long)]
+    #[arg(long, help = "Author directory under the paper root")]
     author: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Maximum number of papers to queue/process")]
     limit: Option<usize>,
-    #[arg(long)]
+    #[arg(long, help = "Re-analyze papers even if their profiles are current")]
     force: bool,
-    #[arg(long)]
+    #[arg(long, help = "Only retry papers with failed analysis jobs")]
+    failed_only: bool,
+    #[arg(long, help = "Only analyze papers whose stored profile is stale")]
+    stale_only: bool,
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Maximum stored job attempts before giving up"
+    )]
+    max_attempts: i64,
+    #[arg(
+        long,
+        help = "Skip rebuilding the author-level profile after paper analysis"
+    )]
     skip_author_profile: bool,
+}
+
+#[derive(Args, Clone)]
+struct EmbedArgs {
+    #[arg(long, help = "Author directory under the paper root")]
+    author: Option<String>,
+    #[arg(long, help = "Maximum number of chunks to embed")]
+    limit: Option<usize>,
+    #[arg(
+        long,
+        help = "Refresh embeddings even when the stored model/version matches"
+    )]
+    force: bool,
 }
 
 #[derive(Args)]
 struct AskArgs {
-    #[arg(long)]
+    #[arg(long, help = "Author directory under the paper root")]
     author: Option<String>,
+    #[arg(help = "Question text")]
     question: Vec<String>,
 }
 
 #[derive(Args)]
 struct EvalArgs {
-    #[arg(long)]
+    #[arg(long, help = "Path to a JSON fixture of golden questions")]
     fixture: std::path::PathBuf,
-    #[arg(long, default_value_t = 8)]
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Number of retrieved chunks to evaluate"
+    )]
     top_k: usize,
+    #[arg(long, help = "Include per-question trace details in the JSON report")]
+    trace: bool,
+}
+
+#[derive(Args)]
+struct JobsArgs {
+    #[arg(long, help = "Filter jobs by author")]
+    author: Option<String>,
+    #[arg(
+        long,
+        help = "Filter by job status: queued, running, failed, succeeded, cancelled, retry_waiting"
+    )]
+    status: Option<String>,
+    #[arg(long, default_value_t = 20, help = "Maximum jobs to print")]
+    limit: usize,
+    #[arg(long, help = "Move failed jobs back to the queued state")]
+    retry_failed: bool,
+    #[arg(long, help = "Cancel a job by numeric ID")]
+    cancel: Option<i64>,
+}
+
+#[derive(Subcommand)]
+enum LogsCommand {
+    #[command(about = "Show recent QA logs or QA error counts")]
+    Qa(LogQaArgs),
+    #[command(about = "Show recent analysis jobs or job error counts")]
+    Jobs(LogJobsArgs),
+}
+
+#[derive(Args)]
+struct LogQaArgs {
+    #[arg(long, help = "Filter QA logs by author")]
+    author: Option<String>,
+    #[arg(long, default_value_t = 10, help = "Maximum QA logs to print")]
+    last: usize,
+    #[arg(long, help = "Show grouped QA error counts instead of log rows")]
+    errors: bool,
+}
+
+#[derive(Args)]
+struct LogJobsArgs {
+    #[arg(long, help = "Filter job logs by author")]
+    author: Option<String>,
+    #[arg(long, default_value_t = 10, help = "Maximum jobs to print")]
+    last: usize,
+    #[arg(long, help = "Only show failed jobs")]
+    failed: bool,
+    #[arg(long, help = "Show grouped job error counts instead of job rows")]
+    errors: bool,
+}
+
+#[derive(Args)]
+struct ProfileArgs {
+    #[arg(long, help = "Author directory under the paper root")]
+    author: Option<String>,
+    #[arg(
+        long,
+        help = "Force rebuilding the author-level profile from paper profiles"
+    )]
+    rebuild: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -142,8 +265,12 @@ pub fn run() -> Result<()> {
                     )?;
                     cmd_analyze(args, &settings)
                 }
+                Command::Embed(args) => cmd_embed(args, &settings),
                 Command::Ask(args) => cmd_ask(args, &settings),
                 Command::Eval(args) => cmd_eval(args, &settings),
+                Command::Jobs(args) => cmd_jobs(args, &settings),
+                Command::Logs { command } => cmd_logs(command, &settings),
+                Command::Status(args) => cmd_status(args, &settings),
                 Command::Profile(args) => cmd_profile(args, &settings),
                 Command::ServeTelegram => cmd_serve_telegram(&settings),
                 Command::Config(_) | Command::Llm { .. } | Command::Tg { .. } => unreachable!(),
@@ -190,7 +317,7 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
             current
                 .get("CHECK_PAPER_DEFAULT_AUTHOR")
                 .map(String::as_str)
-                .unwrap_or("root"),
+                .unwrap_or(""),
             false,
         )?,
     );
@@ -219,6 +346,8 @@ fn cmd_llm_config(args: LlmConfigArgs) -> Result<()> {
             "CHECK_PAPER_LLM_MODEL",
             "CHECK_PAPER_LLM_TIMEOUT_SECS",
             "CHECK_PAPER_LLM_TLS_BACKEND",
+            "CHECK_PAPER_LLM_PROMPT_COST_PER_1K",
+            "CHECK_PAPER_LLM_COMPLETION_COST_PER_1K",
         ])?;
         return Ok(());
     }
@@ -277,6 +406,28 @@ fn cmd_llm_config(args: LlmConfigArgs) -> Result<()> {
                 .get("CHECK_PAPER_LLM_TLS_BACKEND")
                 .map(String::as_str)
                 .unwrap_or("rustls"),
+            false,
+        )?,
+    );
+    updates.insert(
+        "CHECK_PAPER_LLM_PROMPT_COST_PER_1K".to_string(),
+        prompt_value(
+            "prompt-cost-per-1k",
+            current
+                .get("CHECK_PAPER_LLM_PROMPT_COST_PER_1K")
+                .map(String::as_str)
+                .unwrap_or(""),
+            false,
+        )?,
+    );
+    updates.insert(
+        "CHECK_PAPER_LLM_COMPLETION_COST_PER_1K".to_string(),
+        prompt_value(
+            "completion-cost-per-1k",
+            current
+                .get("CHECK_PAPER_LLM_COMPLETION_COST_PER_1K")
+                .map(String::as_str)
+                .unwrap_or(""),
             false,
         )?,
     );
@@ -447,8 +598,14 @@ fn cmd_ingest(args: AuthorArgs, settings: &Settings) -> Result<()> {
     for paper_dir in &paper_dirs {
         progress.set_message(display_name(paper_dir));
         let paper = load_paper(&settings.paper_root, paper_dir)?;
-        let chunks = chunk_paper(&paper, 3200, 350);
-        if storage.upsert_paper(&paper, &chunks)? {
+        let chunks = chunk_paper(&paper, settings.chunk_max_chars, settings.chunk_overlap);
+        if storage.upsert_paper_with_chunker(
+            &paper,
+            &chunks,
+            &settings.chunker_version,
+            settings.chunk_max_chars,
+            settings.chunk_overlap,
+        )? {
             changed_count += 1;
         }
         progress.inc(1);
@@ -466,58 +623,106 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
     require_llm(settings)?;
     let storage = Storage::open(&settings.db_path)?;
     let llm = make_llm(settings)?;
-    let mut rows = storage.papers_needing_analysis(&author, args.force)?;
-    if let Some(limit) = args.limit {
-        rows.truncate(limit);
-    }
-    println!("papers needing analysis: {}", rows.len());
+    let plan = AnalysisService::new(&storage).enqueue_author(
+        &author,
+        AnalysisQueueOptions {
+            failed_only: args.failed_only,
+            stale_only: args.stale_only,
+            force: args.force,
+            limit: args.limit,
+            max_attempts: args.max_attempts,
+            model_id: llm.model_name(),
+            chunker_version: &settings.chunker_version,
+        },
+    )?;
+    println!(
+        "papers needing analysis: {}; newly queued: {queued}",
+        plan.candidates.len(),
+        queued = plan.queued
+    );
     let mut failures = Vec::new();
-    for (index, row) in rows.iter().enumerate() {
+    let worker_id = format!("ppc-{}", process::id());
+    let process_limit = plan.candidates.len();
+    for index in 0..process_limit {
+        let Some(task) =
+            storage.claim_next_analysis_job(&author, "analyze", &worker_id, 30 * 60)?
+        else {
+            break;
+        };
+        let row = task.candidate;
         let paper_dir = settings.paper_root.join(&row.author).join(&row.paper_id);
         let paper = load_paper(&settings.paper_root, &paper_dir)?;
         let message = format!(
-            "[{}/{}] {} {}",
+            "[{}/{}] job #{} attempt {}/{} {} {}",
             index + 1,
-            rows.len(),
+            process_limit,
+            task.id,
+            task.attempt_count + 1,
+            task.max_attempts,
             paper.year(),
             paper.title()
         );
         let progress = paper_progress(message.clone());
-        storage.record_analysis_job(&paper.key(), "analyze", "running", None)?;
-        match analyze_paper_with_retries(&paper, &llm, &progress, &message) {
+        match analyze_paper_with_retries(
+            &paper,
+            &llm,
+            &progress,
+            &message,
+            settings.chunk_max_chars,
+            settings.chunk_overlap,
+        ) {
             Ok(profile) => {
-                storage.save_paper_profile(&paper.key(), &paper.source_hash, &profile)?;
-                storage.save_paper_facts(&paper.key(), &extract_section_facts(&paper))?;
-                storage.record_analysis_job(&paper.key(), "analyze", "succeeded", None)?;
+                storage.save_paper_profile_with_metadata(
+                    &paper.key(),
+                    &paper.source_hash,
+                    &profile,
+                    PAPER_PROFILE_SCHEMA_VERSION,
+                    PAPER_PROFILE_PROMPT_VERSION,
+                    llm.model_name(),
+                    &settings.chunker_version,
+                )?;
+                storage.save_paper_facts(
+                    &paper.key(),
+                    &extract_section_facts(
+                        &paper,
+                        settings.chunk_max_chars,
+                        settings.chunk_overlap,
+                    ),
+                )?;
+                storage.complete_analysis_job(task.id, &paper.key())?;
                 progress.finish_with_message(format!("{message} done"));
             }
             Err(err) => {
                 progress.finish_with_message(format!("{message} failed"));
-                storage.record_analysis_job(
+                let status = storage.fail_analysis_job(
+                    task.id,
                     &paper.key(),
-                    "analyze",
-                    "failed",
-                    Some(&err.to_string()),
+                    "analyze_error",
+                    &err.to_string(),
                 )?;
+                progress.println(format!("job #{} marked {status}", task.id));
                 failures.push((paper.key(), err.to_string()));
             }
         }
     }
     println!(
         "analyzed {}; failed {}",
-        rows.len().saturating_sub(failures.len()),
+        plan.candidates.len().saturating_sub(failures.len()),
         failures.len()
     );
 
     if !args.skip_author_profile {
-        let profiles = storage.paper_profiles(&author, None)?;
-        if !profiles.is_empty() {
-            let author_profile = build_author_profile(&author, &profiles, Some(&llm))?;
-            storage.save_author_profile(&author, &author_profile)?;
-            println!(
-                "updated author profile with {} paper profiles",
-                profiles.len()
-            );
+        match ProfileService::new(&storage).rebuild_author_profile(&author, &llm, false)? {
+            AuthorProfileRebuild::NoPaperProfiles => {}
+            AuthorProfileRebuild::Current { .. } => {
+                println!("author profile already up to date");
+            }
+            AuthorProfileRebuild::Rebuilt { profile_count } => {
+                println!(
+                    "updated author profile with {} paper profiles",
+                    profile_count
+                );
+            }
         }
     }
     if !failures.is_empty() {
@@ -535,16 +740,74 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
+    let author = resolve_author(args.author.as_deref(), settings)?;
+    require_embedding(settings)?;
+    let storage = Storage::open(&settings.db_path)?;
+    let client = make_embedding(settings)?;
+    let embeddings = EmbeddingService::new(&storage);
+    let pending = embeddings.pending_chunks(
+        &author,
+        args.limit,
+        client.model_name(),
+        client.model_version(),
+        args.force,
+    )?;
+    println!("chunks needing embedding: {}", pending.len());
+    let progress = progress_bar(pending.len() as u64, "embedding");
+    let batch_size = client.batch_size();
+    for batch in pending.chunks(batch_size) {
+        let input = batch
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    item.chunk.title, item.chunk.doi, item.chunk.section, item.chunk.text
+                )
+            })
+            .collect::<Vec<_>>();
+        let vectors = match client.embed(&input) {
+            Ok(vectors) => vectors,
+            Err(err) => {
+                for item in batch {
+                    embeddings.record_failure(
+                        item,
+                        client.model_name(),
+                        client.model_version(),
+                        &err.to_string(),
+                    )?;
+                }
+                return Err(err);
+            }
+        };
+        if vectors.len() != batch.len() {
+            return Err(anyhow!(
+                "embedding API returned {} vectors for {} inputs",
+                vectors.len(),
+                batch.len()
+            ));
+        }
+        for (item, vector) in batch.iter().zip(vectors.iter()) {
+            embeddings.save_success(item, client.model_name(), client.model_version(), vector)?;
+            progress.inc(1);
+        }
+    }
+    progress.finish_with_message("embedded chunks");
+    Ok(())
+}
+
 fn analyze_paper_with_retries(
     paper: &crate::papers::models::Paper,
     llm: &OpenAiCompatibleClient,
     progress: &ProgressBar,
     message: &str,
+    chunk_max_chars: usize,
+    chunk_overlap: usize,
 ) -> Result<serde_json::Value> {
     let mut last_error = None;
     for attempt in 1..=3 {
         progress.set_message(format!("{message} attempt {attempt}/3"));
-        match analyze_paper(paper, llm, 22000) {
+        match analyze_paper(paper, llm, 22000, chunk_max_chars, chunk_overlap) {
             Ok(profile) => return Ok(profile),
             Err(err) => {
                 progress.println(format!("{message} attempt {attempt}/3 failed: {err}"));
@@ -560,31 +823,214 @@ fn analyze_paper_with_retries(
 
 fn cmd_ask(args: AskArgs, settings: &Settings) -> Result<()> {
     let author = resolve_author(args.author.as_deref(), settings)?;
-    require_llm(settings)?;
     let question = args.question.join(" ");
+    if question.trim().is_empty() {
+        return Err(anyhow!("missing question; pass text after `ppc ask`"));
+    }
+    require_llm(settings)?;
     let storage = Storage::open(&settings.db_path)?;
-    let answerer = Answerer::new(&storage, make_llm(settings)?);
-    println!("{}", answerer.answer(&author, &question)?);
+    let qa = QaService::new(
+        &storage,
+        make_llm(settings)?,
+        make_optional_embedding(settings)?,
+    );
+    println!("{}", qa.answer(&author, &question)?);
     Ok(())
 }
 
 fn cmd_eval(args: EvalArgs, settings: &Settings) -> Result<()> {
     let storage = Storage::open(&settings.db_path)?;
-    let report = run_golden_eval(&storage, &args.fixture, args.top_k)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let eval = EvalService::new(&storage);
+    let report = eval.run_golden(&args.fixture, args.top_k)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&eval.report_json(&report, args.trace)?)?
+    );
     Ok(())
 }
 
-fn cmd_profile(args: AuthorArgs, settings: &Settings) -> Result<()> {
+fn cmd_jobs(args: JobsArgs, settings: &Settings) -> Result<()> {
+    let storage = Storage::open(&settings.db_path)?;
+    let jobs = JobService::new(&storage);
+    if let Some(job_id) = args.cancel {
+        jobs.cancel(job_id)?;
+        println!("cancelled job #{job_id}");
+        return Ok(());
+    }
+    if args.retry_failed {
+        let count = jobs.retry_failed(args.author.as_deref())?;
+        println!("queued {count} failed jobs for retry");
+        return Ok(());
+    }
+    let rows = jobs.list(args.author.as_deref(), args.status.as_deref(), args.limit)?;
+    if rows.is_empty() {
+        println!("no jobs");
+        return Ok(());
+    }
+    for job in rows {
+        println!(
+            "#{} [{}] {} {} model={} updated={}",
+            job.id,
+            job.status,
+            job.job_type,
+            job.paper_key.as_deref().unwrap_or("-"),
+            job.model_id.as_deref().unwrap_or("-"),
+            job.updated_at
+        );
+        if let Some(error_code) = job.error_code.as_deref() {
+            println!("  error_code={error_code}");
+        }
+        if let Some(error) = job.error.as_deref() {
+            if !error.trim().is_empty() {
+                println!("  error={}", error.trim());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_logs(command: LogsCommand, settings: &Settings) -> Result<()> {
+    let storage = Storage::open(&settings.db_path)?;
+    match command {
+        LogsCommand::Qa(args) => {
+            if args.errors {
+                let counts = storage.qa_error_counts(args.author.as_deref())?;
+                if counts.is_empty() {
+                    println!("no qa errors");
+                } else {
+                    for (error_code, count) in counts {
+                        println!("{error_code}: {count}");
+                    }
+                }
+                return Ok(());
+            }
+            let logs = storage.qa_logs(args.author.as_deref(), args.last)?;
+            if logs.is_empty() {
+                println!("no qa logs");
+                return Ok(());
+            }
+            for log in logs {
+                println!(
+                    "#{} [{}] author={} model={} latency_ms={} prompt_tokens={} completion_tokens={} total_tokens={} cost_usd={} question={}",
+                    log.id,
+                    log.created_at,
+                    log.author,
+                    log.model.as_deref().unwrap_or("-"),
+                    log.latency_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    log.prompt_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    log.completion_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    log.total_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    log.cost_usd
+                        .map(|value| format!("{value:.6}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    log.question
+                );
+                if let Some(error_code) = log.error_code.as_deref() {
+                    println!("  error_code={error_code}");
+                }
+            }
+        }
+        LogsCommand::Jobs(args) => {
+            let jobs = JobService::new(&storage);
+            let status = args.failed.then_some("failed");
+            if args.errors {
+                let counts = jobs.error_counts(args.author.as_deref(), status)?;
+                if counts.is_empty() {
+                    println!("no job errors");
+                } else {
+                    for (error_code, count) in counts {
+                        println!("{error_code}: {count}");
+                    }
+                }
+                return Ok(());
+            }
+            let rows = jobs.list(args.author.as_deref(), status, args.last)?;
+            if rows.is_empty() {
+                println!("no jobs");
+                return Ok(());
+            }
+            for job in rows {
+                println!(
+                    "#{} [{}] {} {} model={} updated={}",
+                    job.id,
+                    job.status,
+                    job.job_type,
+                    job.paper_key.as_deref().unwrap_or("-"),
+                    job.model_id.as_deref().unwrap_or("-"),
+                    job.updated_at
+                );
+                if let Some(error_code) = job.error_code.as_deref() {
+                    println!("  error_code={error_code}");
+                }
+                if let Some(error) = job.error.as_deref() {
+                    if !error.trim().is_empty() {
+                        println!("  error={}", error.trim());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_status(args: AuthorArgs, settings: &Settings) -> Result<()> {
+    let storage = Storage::open(&settings.db_path)?;
+    let status = StatusService::new(&storage).summary(args.author.as_deref())?;
+    println!("papers: {}", status.papers);
+    println!("analyzed: {}", status.analyzed);
+    println!("stale_papers: {}", status.stale_papers);
+    println!("queued_jobs: {}", status.queued_jobs);
+    println!("running_jobs: {}", status.running_jobs);
+    println!("retry_waiting_jobs: {}", status.retry_waiting_jobs);
+    println!("failed_jobs: {}", status.failed_jobs);
+    println!("cancelled_jobs: {}", status.cancelled_jobs);
+    println!("qa_logs: {}", status.qa_logs);
+    if let Some(latency) = status.avg_qa_latency_ms {
+        println!("avg_qa_latency_ms: {:.0}", latency);
+    }
+    if let Some(tokens) = status.total_qa_tokens {
+        println!("total_qa_tokens: {tokens}");
+    }
+    if let Some(cost) = status.total_qa_cost_usd {
+        println!("total_qa_cost_usd: {:.6}", cost);
+    }
+    Ok(())
+}
+
+fn cmd_profile(args: ProfileArgs, settings: &Settings) -> Result<()> {
     let author = resolve_author(args.author.as_deref(), settings)?;
     let storage = Storage::open(&settings.db_path)?;
-    if let Some(profile) = storage.get_author_profile(&author)? {
-        println!("{}", serde_json::to_string_pretty(&profile)?);
-        Ok(())
-    } else {
-        println!("no author profile for {author}");
-        Ok(())
+    if args.rebuild {
+        require_llm(settings)?;
+        let llm = make_llm(settings)?;
+        match ProfileService::new(&storage).rebuild_author_profile(&author, &llm, true)? {
+            AuthorProfileRebuild::NoPaperProfiles => {
+                println!("no paper profiles for {author}");
+            }
+            AuthorProfileRebuild::Current { profile_count }
+            | AuthorProfileRebuild::Rebuilt { profile_count } => {
+                println!("rebuilt author profile with {profile_count} paper profiles");
+            }
+        }
+        return Ok(());
     }
+    match ProfileService::new(&storage).author_profile(&author)? {
+        AuthorProfileLookup::Found(profile) => {
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        AuthorProfileLookup::Missing { .. } => {
+            println!("no author profile for {author}");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_serve_telegram(settings: &Settings) -> Result<()> {
@@ -596,6 +1042,7 @@ fn cmd_serve_telegram(settings: &Settings) -> Result<()> {
     let handlers = BotHandlers::new(
         settings.db_path.clone(),
         make_llm(settings)?,
+        make_optional_embedding(settings)?,
         settings.default_author.clone(),
     );
     TelegramBot::new(
@@ -636,5 +1083,114 @@ fn make_llm(settings: &Settings) -> Result<OpenAiCompatibleClient> {
         proxy: settings.proxy.clone(),
         timeout_secs: settings.llm_timeout_secs,
         tls_backend: settings.llm_tls_backend.clone(),
+        prompt_cost_per_1k: settings.llm_prompt_cost_per_1k,
+        completion_cost_per_1k: settings.llm_completion_cost_per_1k,
     })
+}
+
+fn require_embedding(settings: &Settings) -> Result<()> {
+    if settings.embedding_provider.trim() != "openai-compatible" {
+        return Err(anyhow!(
+            "missing or unsupported CHECK_PAPER_EMBEDDING_PROVIDER; set it to `openai-compatible`"
+        ));
+    }
+    if settings.embedding_api_key.is_none() {
+        return Err(anyhow!("missing CHECK_PAPER_EMBEDDING_API_KEY"));
+    }
+    if settings.embedding_model.trim().is_empty() {
+        return Err(anyhow!("missing CHECK_PAPER_EMBEDDING_MODEL"));
+    }
+    Ok(())
+}
+
+fn make_embedding(settings: &Settings) -> Result<OpenAiCompatibleEmbeddingClient> {
+    OpenAiCompatibleEmbeddingClient::new(EmbeddingConfig {
+        provider: settings.embedding_provider.clone(),
+        base_url: settings.embedding_base_url.clone(),
+        api_key: settings.embedding_api_key.clone(),
+        model: settings.embedding_model.clone(),
+        model_version: settings.embedding_model_version.clone(),
+        proxy: settings.proxy.clone(),
+        timeout_secs: settings.embedding_timeout_secs,
+        tls_backend: settings.embedding_tls_backend.clone(),
+        batch_size: settings.embedding_batch_size,
+    })
+}
+
+fn make_optional_embedding(settings: &Settings) -> Result<Option<OpenAiCompatibleEmbeddingClient>> {
+    if settings.embedding_provider.trim() != "openai-compatible" {
+        return Ok(None);
+    }
+    if settings.embedding_api_key.is_none() || settings.embedding_model.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(make_embedding(settings)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{AskArgs, cmd_ask, resolve_author};
+    use crate::config::Settings;
+
+    fn settings(default_author: Option<&str>) -> Settings {
+        Settings {
+            paper_root: PathBuf::from("paper"),
+            db_path: PathBuf::from("data/test.sqlite"),
+            default_author: default_author.map(str::to_string),
+            proxy: None,
+            llm_base_url: "https://api.openai.com/v1".to_string(),
+            llm_api_key: None,
+            llm_model: String::new(),
+            llm_timeout_secs: 180,
+            llm_tls_backend: "rustls".to_string(),
+            llm_prompt_cost_per_1k: None,
+            llm_completion_cost_per_1k: None,
+            embedding_provider: "disabled".to_string(),
+            embedding_base_url: "https://api.openai.com/v1".to_string(),
+            embedding_api_key: None,
+            embedding_model: String::new(),
+            embedding_model_version: None,
+            embedding_timeout_secs: 180,
+            embedding_tls_backend: "rustls".to_string(),
+            embedding_batch_size: 64,
+            chunk_max_chars: 3200,
+            chunk_overlap: 350,
+            chunker_version: "section-char-v1".to_string(),
+            telegram_bot_token: None,
+            telegram_chat_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_author_requires_explicit_or_configured_author() {
+        let without_default = settings(None);
+        let err = resolve_author(None, &without_default)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing author"));
+        assert_eq!(
+            resolve_author(Some("Alice"), &without_default).unwrap(),
+            "Alice"
+        );
+
+        let with_default = settings(Some("Bob"));
+        assert_eq!(resolve_author(None, &with_default).unwrap(), "Bob");
+    }
+
+    #[test]
+    fn ask_rejects_empty_question_before_requiring_llm() {
+        let err = cmd_ask(
+            AskArgs {
+                author: Some("Alice".to_string()),
+                question: Vec::new(),
+            },
+            &settings(None),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("missing question"));
+    }
 }

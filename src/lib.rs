@@ -5,5 +5,7 @@ pub mod eval;
 pub mod papers;
 pub mod qa;
 pub mod retrieval;
+pub mod schemas;
+pub mod services;
 pub mod storage;
 pub mod understanding;

@@ -1,1 +1,10 @@
 pub mod chunker;
+pub mod dense_route;
+pub mod embedding;
+pub mod fact_route;
+pub mod fts_route;
+pub mod fusion;
+pub mod hybrid;
+pub mod like_route;
+pub mod profile_route;
+pub mod query;

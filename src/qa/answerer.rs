@@ -1,13 +1,17 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
-use crate::storage::Storage;
-use crate::understanding::json_utils::parse_json_object;
-use crate::understanding::llm::OpenAiCompatibleClient;
-use crate::understanding::prompts::{qa_messages, qa_repair_messages};
+use crate::qa::renderer::render_qa_answer;
+use crate::qa::verifier::{parse_qa_answer, verify_qa_answer};
+use crate::retrieval::embedding::OpenAiCompatibleEmbeddingClient;
+use crate::retrieval::profile_route::search_profiles_for_query;
+use crate::schemas::qa_answer::{QA_ANSWER_SCHEMA_VERSION, signals_insufficient};
+use crate::storage::{QaLogMetadata, Storage};
+use crate::understanding::llm::{LlmUsage, OpenAiCompatibleClient};
+use crate::understanding::prompts::{QA_PROMPT_VERSION, qa_messages, qa_repair_messages};
 
 const PROFILE_CONTEXT_LIMIT: usize = 8;
 const DEFAULT_CHUNK_LIMIT: usize = 8;
@@ -17,36 +21,107 @@ const QA_CHUNK_LIMIT_ENV: &str = "CHECK_PAPER_QA_CHUNK_LIMIT";
 pub struct Answerer<'a> {
     storage: &'a Storage,
     llm: OpenAiCompatibleClient,
+    embedding: Option<OpenAiCompatibleEmbeddingClient>,
 }
 
 impl<'a> Answerer<'a> {
     pub fn new(storage: &'a Storage, llm: OpenAiCompatibleClient) -> Self {
-        Self { storage, llm }
+        Self {
+            storage,
+            llm,
+            embedding: None,
+        }
+    }
+
+    pub fn new_with_embedding(
+        storage: &'a Storage,
+        llm: OpenAiCompatibleClient,
+        embedding: Option<OpenAiCompatibleEmbeddingClient>,
+    ) -> Self {
+        Self {
+            storage,
+            llm,
+            embedding,
+        }
     }
 
     pub fn answer(&self, author: &str, question: &str) -> Result<String> {
         let started = Instant::now();
-        let profiles = self
-            .storage
-            .search_profiles(author, question, PROFILE_CONTEXT_LIMIT)?;
+        let profiles =
+            search_profiles_for_query(self.storage, author, question, PROFILE_CONTEXT_LIMIT)?;
         let chunk_limit = qa_chunk_limit();
-        let mut chunks = self.context_chunks(author, question, &profiles, chunk_limit)?;
+        let (mut chunks, mut retrieval_trace) =
+            self.context_chunks(author, question, &profiles, chunk_limit)?;
 
-        let first = self
-            .llm
-            .chat(qa_messages(question, &profiles, &chunks), 0.2, 2200)?;
-        if should_retry_with_more_chunks(&first, &chunks) {
-            chunks =
+        let first =
+            self.llm
+                .chat_with_usage(qa_messages(question, &profiles, &chunks), 0.2, 2200)?;
+        if should_retry_with_more_chunks(&first.content, &chunks) {
+            (chunks, retrieval_trace) =
                 self.context_chunks(author, question, &profiles, retry_chunk_limit(chunk_limit))?;
-            let second = self
-                .llm
-                .chat(qa_messages(question, &profiles, &chunks), 0.2, 2600)?;
-            let repaired = self.valid_or_repaired_answer(&second, &chunks)?;
-            self.log_answer(author, question, &profiles, &chunks, &repaired, started)?;
+            let second =
+                self.llm
+                    .chat_with_usage(qa_messages(question, &profiles, &chunks), 0.2, 2600)?;
+            let repaired = match self.valid_or_repaired_answer(&second.content, &chunks) {
+                Ok(answer) => answer,
+                Err(err) => {
+                    self.log_failed_answer(
+                        author,
+                        question,
+                        &profiles,
+                        &chunks,
+                        &retrieval_trace,
+                        &second.content,
+                        &err.to_string(),
+                        started,
+                        2600,
+                        Some(&second.usage),
+                    )?;
+                    return Err(err);
+                }
+            };
+            self.log_answer(
+                author,
+                question,
+                &profiles,
+                &chunks,
+                &retrieval_trace,
+                &repaired,
+                started,
+                2600,
+                Some(&second.usage),
+            )?;
             return Ok(render_qa_answer(&repaired));
         }
-        let repaired = self.valid_or_repaired_answer(&first, &chunks)?;
-        self.log_answer(author, question, &profiles, &chunks, &repaired, started)?;
+        let repaired = match self.valid_or_repaired_answer(&first.content, &chunks) {
+            Ok(answer) => answer,
+            Err(err) => {
+                self.log_failed_answer(
+                    author,
+                    question,
+                    &profiles,
+                    &chunks,
+                    &retrieval_trace,
+                    &first.content,
+                    &err.to_string(),
+                    started,
+                    2200,
+                    Some(&first.usage),
+                )?;
+                return Err(err);
+            }
+        };
+        self.log_answer(
+            author,
+            question,
+            &profiles,
+            &chunks,
+            &retrieval_trace,
+            &repaired,
+            started,
+            2200,
+            Some(&first.usage),
+        )?;
         Ok(render_qa_answer(&repaired))
     }
 
@@ -60,11 +135,11 @@ impl<'a> Answerer<'a> {
         F: FnMut(&str) -> Result<()>,
     {
         let started = Instant::now();
-        let profiles = self
-            .storage
-            .search_profiles(author, question, PROFILE_CONTEXT_LIMIT)?;
+        let profiles =
+            search_profiles_for_query(self.storage, author, question, PROFILE_CONTEXT_LIMIT)?;
         let chunk_limit = qa_chunk_limit();
-        let mut chunks = self.context_chunks(author, question, &profiles, chunk_limit)?;
+        let (mut chunks, mut retrieval_trace) =
+            self.context_chunks(author, question, &profiles, chunk_limit)?;
 
         let first = self
             .llm
@@ -76,7 +151,7 @@ impl<'a> Answerer<'a> {
             )
             .await?;
         if should_retry_with_more_chunks(&first, &chunks) {
-            chunks =
+            (chunks, retrieval_trace) =
                 self.context_chunks(author, question, &profiles, retry_chunk_limit(chunk_limit))?;
             let second = self
                 .llm
@@ -87,12 +162,66 @@ impl<'a> Answerer<'a> {
                     |delta| on_delta(delta),
                 )
                 .await?;
-            let repaired = self.valid_or_repaired_answer(&second, &chunks)?;
-            self.log_answer(author, question, &profiles, &chunks, &repaired, started)?;
+            let repaired = match self.valid_or_repaired_answer(&second, &chunks) {
+                Ok(answer) => answer,
+                Err(err) => {
+                    self.log_failed_answer(
+                        author,
+                        question,
+                        &profiles,
+                        &chunks,
+                        &retrieval_trace,
+                        &second,
+                        &err.to_string(),
+                        started,
+                        2600,
+                        None,
+                    )?;
+                    return Err(err);
+                }
+            };
+            self.log_answer(
+                author,
+                question,
+                &profiles,
+                &chunks,
+                &retrieval_trace,
+                &repaired,
+                started,
+                2600,
+                None,
+            )?;
             return Ok(render_qa_answer(&repaired));
         }
-        let repaired = self.valid_or_repaired_answer(&first, &chunks)?;
-        self.log_answer(author, question, &profiles, &chunks, &repaired, started)?;
+        let repaired = match self.valid_or_repaired_answer(&first, &chunks) {
+            Ok(answer) => answer,
+            Err(err) => {
+                self.log_failed_answer(
+                    author,
+                    question,
+                    &profiles,
+                    &chunks,
+                    &retrieval_trace,
+                    &first,
+                    &err.to_string(),
+                    started,
+                    2200,
+                    None,
+                )?;
+                return Err(err);
+            }
+        };
+        self.log_answer(
+            author,
+            question,
+            &profiles,
+            &chunks,
+            &retrieval_trace,
+            &repaired,
+            started,
+            2200,
+            None,
+        )?;
         Ok(render_qa_answer(&repaired))
     }
 
@@ -102,8 +231,8 @@ impl<'a> Answerer<'a> {
         question: &str,
         profiles: &[serde_json::Value],
         limit: usize,
-    ) -> Result<Vec<crate::storage::SourceChunk>> {
-        let mut chunks = self.storage.search_chunks(author, question, limit)?;
+    ) -> Result<(Vec<crate::storage::SourceChunk>, serde_json::Value)> {
+        let (mut chunks, mut trace) = self.search_chunks(author, question, limit)?;
         if chunks.len() < limit {
             let paper_keys = profiles
                 .iter()
@@ -112,12 +241,57 @@ impl<'a> Answerer<'a> {
                 .collect::<Vec<_>>();
             let remaining = limit - chunks.len();
             let profile_chunks = self.storage.chunks_for_paper_keys(&paper_keys, remaining)?;
+            if let Some(object) = trace.as_object_mut() {
+                object.insert(
+                    "profile_fill_count".to_string(),
+                    profile_chunks.len().into(),
+                );
+            }
             append_unique_chunks(&mut chunks, profile_chunks, limit);
         }
         if chunks.is_empty() {
             chunks = self.storage.recent_chunks(author, limit)?;
+            trace = json!({
+                "routes": {
+                    "recent_fallback": chunks.iter().enumerate().map(|(rank, chunk)| json!({
+                        "rank": rank + 1,
+                        "chunk_id": chunk.id,
+                        "paper_key": chunk.paper_key,
+                        "chunk_index": chunk.chunk_index,
+                        "section": chunk.section,
+                    })).collect::<Vec<_>>()
+                },
+                "fusion": []
+            });
         }
-        Ok(chunks)
+        Ok((chunks, trace))
+    }
+
+    fn search_chunks(
+        &self,
+        author: &str,
+        question: &str,
+        limit: usize,
+    ) -> Result<(Vec<crate::storage::SourceChunk>, serde_json::Value)> {
+        let Some(embedding) = self.embedding.as_ref() else {
+            return self
+                .storage
+                .search_chunks_with_trace(author, question, limit);
+        };
+        let query_vectors = embedding.embed(&[question.to_string()])?;
+        let Some(query_vector) = query_vectors.first() else {
+            return self
+                .storage
+                .search_chunks_with_trace(author, question, limit);
+        };
+        self.storage.search_chunks_with_dense_vector_trace(
+            author,
+            question,
+            limit,
+            embedding.model_name(),
+            embedding.model_version(),
+            query_vector,
+        )
     }
 
     fn log_answer(
@@ -126,8 +300,11 @@ impl<'a> Answerer<'a> {
         question: &str,
         profiles: &[serde_json::Value],
         chunks: &[crate::storage::SourceChunk],
+        retrieval_trace: &serde_json::Value,
         raw_answer: &str,
         started: Instant,
+        max_tokens: i64,
+        usage: Option<&LlmUsage>,
     ) -> Result<()> {
         let retrieval = json!({
             "profile_count": profiles.len(),
@@ -139,20 +316,103 @@ impl<'a> Answerer<'a> {
                 "chunk_id": chunk.id,
                 "chunk_index": chunk.chunk_index,
                 "section": chunk.section,
-            })).collect::<Vec<_>>()
+                "section_kind": chunk.section_kind,
+                "caption_label": chunk.caption_label,
+                "source_hash": chunk.source_hash,
+                "chunk_hash": stored_chunk_hash(chunk),
+                "chunker_version": chunk.chunker_version,
+            })).collect::<Vec<_>>(),
+            "trace": retrieval_trace,
         });
-        let answer_json = parse_qa_answer(raw_answer)
+        let mut answer_json = parse_qa_answer(raw_answer)
             .map(|answer| {
                 serde_json::to_value(answer).unwrap_or_else(|_| json!({ "raw": raw_answer }))
             })
             .unwrap_or_else(|| json!({ "raw": raw_answer }));
-        self.storage.save_qa_log(
+        let snapshot = evidence_snapshot(&answer_json, chunks);
+        if let Some(object) = answer_json.as_object_mut() {
+            object.insert(
+                "answer_schema_version".to_string(),
+                QA_ANSWER_SCHEMA_VERSION.into(),
+            );
+            object.insert("evidence_snapshot".to_string(), snapshot);
+        }
+        self.storage.save_qa_log_with_metadata(
             author,
             question,
             &retrieval,
             &answer_json,
             self.llm.model_name(),
             started.elapsed().as_millis() as i64,
+            Some(QaLogMetadata {
+                answer_schema_version: Some(QA_ANSWER_SCHEMA_VERSION),
+                qa_prompt_version: Some(QA_PROMPT_VERSION),
+                temperature: Some(0.2),
+                max_tokens: Some(max_tokens),
+                prompt_tokens: usage.and_then(|usage| usage.prompt_tokens),
+                completion_tokens: usage.and_then(|usage| usage.completion_tokens),
+                total_tokens: usage.and_then(|usage| usage.total_tokens),
+                cost_usd: usage.and_then(|usage| self.llm.estimate_cost_usd(usage)),
+                error_code: None,
+            }),
+        )
+    }
+
+    fn log_failed_answer(
+        &self,
+        author: &str,
+        question: &str,
+        profiles: &[serde_json::Value],
+        chunks: &[crate::storage::SourceChunk],
+        retrieval_trace: &serde_json::Value,
+        raw_answer: &str,
+        error: &str,
+        started: Instant,
+        max_tokens: i64,
+        usage: Option<&LlmUsage>,
+    ) -> Result<()> {
+        let retrieval = json!({
+            "profile_count": profiles.len(),
+            "chunks": chunks.iter().map(|chunk| json!({
+                "paper_key": chunk.paper_key,
+                "title": chunk.title,
+                "doi": chunk.doi,
+                "year": chunk.year,
+                "chunk_id": chunk.id,
+                "chunk_index": chunk.chunk_index,
+                "section": chunk.section,
+                "section_kind": chunk.section_kind,
+                "caption_label": chunk.caption_label,
+                "source_hash": chunk.source_hash,
+                "chunk_hash": stored_chunk_hash(chunk),
+                "chunker_version": chunk.chunker_version,
+            })).collect::<Vec<_>>(),
+            "trace": retrieval_trace,
+        });
+        let answer_json = json!({
+            "raw": raw_answer,
+            "error": error,
+            "answer_schema_version": QA_ANSWER_SCHEMA_VERSION,
+            "evidence_snapshot": [],
+        });
+        self.storage.save_qa_log_with_metadata(
+            author,
+            question,
+            &retrieval,
+            &answer_json,
+            self.llm.model_name(),
+            started.elapsed().as_millis() as i64,
+            Some(QaLogMetadata {
+                answer_schema_version: Some(QA_ANSWER_SCHEMA_VERSION),
+                qa_prompt_version: Some(QA_PROMPT_VERSION),
+                temperature: Some(0.2),
+                max_tokens: Some(max_tokens),
+                prompt_tokens: usage.and_then(|usage| usage.prompt_tokens),
+                completion_tokens: usage.and_then(|usage| usage.completion_tokens),
+                total_tokens: usage.and_then(|usage| usage.total_tokens),
+                cost_usd: usage.and_then(|usage| self.llm.estimate_cost_usd(usage)),
+                error_code: Some("evidence_invalid"),
+            }),
         )
     }
 
@@ -161,7 +421,7 @@ impl<'a> Answerer<'a> {
         raw_answer: &str,
         chunks: &[crate::storage::SourceChunk],
     ) -> Result<String> {
-        match parse_and_validate_qa_answer(raw_answer, chunks) {
+        match verify_qa_answer(raw_answer, chunks) {
             Ok(_) => Ok(raw_answer.to_string()),
             Err(error) => {
                 let repaired = self.llm.chat(
@@ -169,119 +429,10 @@ impl<'a> Answerer<'a> {
                     0.0,
                     1600,
                 )?;
-                parse_and_validate_qa_answer(&repaired, chunks)?;
+                verify_qa_answer(&repaired, chunks)?;
                 Ok(repaired)
             }
         }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct QaAnswerV1 {
-    pub answer: String,
-    #[serde(default)]
-    pub evidence: Vec<QaEvidence>,
-    #[serde(default)]
-    pub uncertainty: String,
-    #[serde(default)]
-    pub followup_queries: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct QaEvidence {
-    pub paper_key: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub doi: String,
-    #[serde(default)]
-    pub year: String,
-    pub chunk_id: i64,
-    #[serde(default)]
-    pub section: String,
-    #[serde(default)]
-    pub quote_or_summary: String,
-}
-
-pub fn render_qa_answer(content: &str) -> String {
-    parse_qa_answer(content)
-        .map(|answer| answer.render())
-        .unwrap_or_else(|| content.to_string())
-}
-
-fn parse_qa_answer(content: &str) -> Option<QaAnswerV1> {
-    serde_json::from_value(parse_json_object(content)).ok()
-}
-
-fn parse_and_validate_qa_answer(
-    content: &str,
-    chunks: &[crate::storage::SourceChunk],
-) -> Result<QaAnswerV1> {
-    let answer: QaAnswerV1 = serde_json::from_value(parse_json_object(content))?;
-    let valid_chunk_ids = chunks.iter().map(|chunk| chunk.id).collect::<Vec<_>>();
-    for item in &answer.evidence {
-        if !valid_chunk_ids.contains(&item.chunk_id) {
-            anyhow::bail!(
-                "evidence chunk_id {} is not present in provided source_chunks",
-                item.chunk_id
-            );
-        }
-        let Some(chunk) = chunks.iter().find(|chunk| chunk.id == item.chunk_id) else {
-            continue;
-        };
-        if chunk.paper_key != item.paper_key {
-            anyhow::bail!(
-                "evidence paper_key {} does not match chunk {} paper_key {}",
-                item.paper_key,
-                item.chunk_id,
-                chunk.paper_key
-            );
-        }
-    }
-    if answer.evidence.is_empty() && !signals_insufficient(&answer.answer) {
-        anyhow::bail!("answer has no evidence and does not explicitly state insufficient evidence");
-    }
-    Ok(answer)
-}
-
-impl QaAnswerV1 {
-    fn render(&self) -> String {
-        let mut lines = vec![self.answer.trim().to_string()];
-        if !self.evidence.is_empty() {
-            lines.push(String::new());
-            lines.push("依据：".to_string());
-            for (index, item) in self.evidence.iter().enumerate() {
-                let mut line = format!(
-                    "[{}] {} {} {} section={} chunk={}",
-                    index + 1,
-                    item.year,
-                    item.title,
-                    item.doi,
-                    item.section,
-                    item.chunk_id
-                );
-                if !item.quote_or_summary.trim().is_empty() {
-                    line.push_str(&format!("：{}", item.quote_or_summary.trim()));
-                }
-                lines.push(line);
-            }
-        }
-        if !self.uncertainty.trim().is_empty() {
-            lines.push(String::new());
-            lines.push(format!("不确定性：{}", self.uncertainty.trim()));
-        }
-        if !self.followup_queries.is_empty() {
-            lines.push(String::new());
-            lines.push("可继续追问：".to_string());
-            for query in self
-                .followup_queries
-                .iter()
-                .filter(|query| !query.trim().is_empty())
-            {
-                lines.push(format!("- {}", query.trim()));
-            }
-        }
-        lines.join("\n")
     }
 }
 
@@ -320,16 +471,66 @@ fn append_unique_chunks(
     }
 }
 
-fn signals_insufficient(answer: &str) -> bool {
-    let lowered = answer.to_lowercase();
-    lowered.contains("insufficient_context")
-        || answer.contains("证据不足")
-        || answer.contains("信息不足")
+fn evidence_snapshot(
+    answer_json: &serde_json::Value,
+    chunks: &[crate::storage::SourceChunk],
+) -> serde_json::Value {
+    let Some(evidence) = answer_json
+        .get("evidence")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return json!([]);
+    };
+    let items = evidence
+        .iter()
+        .filter_map(|item| {
+            let chunk_id = item.get("chunk_id").and_then(serde_json::Value::as_i64)?;
+            let chunk = chunks.iter().find(|chunk| chunk.id == chunk_id)?;
+            Some(json!({
+                "paper_key": chunk.paper_key,
+                "chunk_id": chunk.id,
+                "chunk_index": chunk.chunk_index,
+                "source_hash": chunk.source_hash,
+                "chunk_hash": stored_chunk_hash(chunk),
+                "chunker_version": chunk.chunker_version,
+                "title": chunk.title,
+                "doi": chunk.doi,
+                "year": chunk.year,
+                "section": chunk.section,
+                "section_kind": chunk.section_kind,
+                "caption_label": chunk.caption_label,
+                "text_excerpt": text_excerpt(&chunk.text, 500),
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!(items)
+}
+
+fn chunk_hash(text: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(text.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn stored_chunk_hash(chunk: &crate::storage::SourceChunk) -> String {
+    if chunk.chunk_hash.trim().is_empty() {
+        chunk_hash(&chunk.text)
+    } else {
+        chunk.chunk_hash.clone()
+    }
+}
+
+fn text_excerpt(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_and_validate_qa_answer, parse_qa_chunk_limit, render_qa_answer};
+    use serde_json::json;
+
+    use super::{evidence_snapshot, parse_qa_chunk_limit};
+    use crate::qa::renderer::render_qa_answer;
+    use crate::qa::verifier::verify_qa_answer;
     use crate::storage::SourceChunk;
 
     #[test]
@@ -372,6 +573,11 @@ mod tests {
             title: "A Paper".to_string(),
             doi: "10.1/test".to_string(),
             year: "2024".to_string(),
+            source_hash: "hash".to_string(),
+            chunk_hash: "chunk-hash".to_string(),
+            chunker_version: "section-char-v1".to_string(),
+            section_kind: "body".to_string(),
+            caption_label: None,
         }];
         let raw = r#"{
             "answer": "这是答案。",
@@ -388,7 +594,7 @@ mod tests {
             "followup_queries": []
         }"#;
 
-        assert!(parse_and_validate_qa_answer(raw, &chunks).is_err());
+        assert!(verify_qa_answer(raw, &chunks).is_err());
     }
 
     #[test]
@@ -402,6 +608,11 @@ mod tests {
             title: "A Paper".to_string(),
             doi: "10.1/test".to_string(),
             year: "2024".to_string(),
+            source_hash: "hash".to_string(),
+            chunk_hash: "chunk-hash".to_string(),
+            chunker_version: "section-char-v1".to_string(),
+            section_kind: "body".to_string(),
+            caption_label: None,
         }];
         let raw = r#"{
             "answer": "这是一个事实性结论。",
@@ -410,7 +621,7 @@ mod tests {
             "followup_queries": []
         }"#;
 
-        assert!(parse_and_validate_qa_answer(raw, &chunks).is_err());
+        assert!(verify_qa_answer(raw, &chunks).is_err());
     }
 
     #[test]
@@ -422,7 +633,49 @@ mod tests {
             "followup_queries": []
         }"#;
 
-        parse_and_validate_qa_answer(raw, &[]).unwrap();
+        verify_qa_answer(raw, &[]).unwrap();
+    }
+
+    #[test]
+    fn evidence_snapshot_captures_chunk_metadata_and_excerpt() {
+        let chunks = vec![SourceChunk {
+            id: 7,
+            paper_key: "Alice/paper-a".to_string(),
+            chunk_index: 3,
+            section: "Results".to_string(),
+            text: "The catalyst reached 82% conversion under mild conditions.".to_string(),
+            title: "A Paper".to_string(),
+            doi: "10.1/test".to_string(),
+            year: "2024".to_string(),
+            source_hash: "source-hash".to_string(),
+            chunk_hash: "chunk-hash".to_string(),
+            chunker_version: "section-char-v1".to_string(),
+            section_kind: "body".to_string(),
+            caption_label: None,
+        }];
+        let snapshot = evidence_snapshot(
+            &json!({
+                "evidence": [{
+                    "paper_key": "Alice/paper-a",
+                    "chunk_id": 7,
+                    "quote_or_summary": "82% conversion"
+                }]
+            }),
+            &chunks,
+        );
+
+        assert_eq!(snapshot[0]["source_hash"], "source-hash");
+        assert_eq!(snapshot[0]["chunk_hash"], "chunk-hash");
+        assert_eq!(snapshot[0]["chunker_version"], "section-char-v1");
+        assert_eq!(snapshot[0]["chunk_index"], 3);
+        assert_eq!(snapshot[0]["section_kind"], "body");
+        assert!(snapshot[0]["caption_label"].is_null());
+        assert!(
+            snapshot[0]["text_excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("82% conversion")
+        );
     }
 
     #[test]

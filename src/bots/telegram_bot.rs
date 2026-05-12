@@ -107,7 +107,7 @@ impl TelegramBot {
                     continue;
                 }
                 let text = strip_bot_mention(&text, bot_username.as_deref());
-                if text.trim().starts_with("/cancel") {
+                if is_dispatcher_cancel_command(text.trim()) {
                     match dispatcher.cancel(message.chat.id) {
                         DispatchAction::Cancelled { active_job_id, .. } => {
                             if let Some(job_id) = active_job_id {
@@ -186,7 +186,7 @@ impl TelegramBot {
         } else {
             let reply = self
                 .handlers
-                .handle_text(&text)
+                .handle_text(chat_id, &text)
                 .unwrap_or_else(|err| format!("处理失败：{err}"));
             if !self.is_job_cancelled(job_id) {
                 self.send_long_message(chat_id, &reply).await?;
@@ -212,7 +212,7 @@ impl TelegramBot {
         let cancelled_jobs = self.cancelled_jobs.clone();
         let reply = self
             .handlers
-            .handle_text_stream(text, move |delta| {
+            .handle_text_stream(chat_id, text, move |delta| {
                 if cancelled_jobs
                     .lock()
                     .is_ok_and(|cancelled| cancelled.contains(&job_id))
@@ -452,7 +452,15 @@ fn should_stream_text(text: &str) -> bool {
         && !stripped.starts_with("/profile")
         && !stripped.starts_with("/sources")
         && !stripped.starts_with("/status")
+        && !stripped.starts_with("/jobs")
         && !stripped.starts_with("/cancel")
+        && !stripped.starts_with("/use_author")
+        && !stripped.starts_with("/current_author")
+}
+
+fn is_dispatcher_cancel_command(text: &str) -> bool {
+    let mut parts = text.split_whitespace();
+    matches!(parts.next(), Some("/cancel")) && parts.next().is_none()
 }
 
 fn telegram_message_text(text: &str) -> String {
@@ -609,7 +617,9 @@ fn mentions_bot(text: &str, bot_username: &str) -> bool {
 fn is_untargeted_bot_command(text: &str) -> bool {
     matches!(
         text.split_whitespace().next(),
-        Some("/start" | "/profile" | "/ask" | "/sources" | "/status" | "/cancel")
+        Some("/start" | "/profile" | "/ask" | "/sources" | "/status" | "/jobs" | "/cancel")
+            | Some("/use_author")
+            | Some("/current_author")
     )
 }
 
@@ -650,8 +660,9 @@ fn is_command_boundary(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_MESSAGE_CHARS, is_untargeted_bot_command, mentions_bot, should_stream_text,
-        strip_bot_mention, telegram_message_pages, telegram_retry_after,
+        TELEGRAM_MAX_MESSAGE_CHARS, is_dispatcher_cancel_command, is_untargeted_bot_command,
+        mentions_bot, should_stream_text, strip_bot_mention, telegram_message_pages,
+        telegram_retry_after,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -683,6 +694,7 @@ mod tests {
         assert!(is_untargeted_bot_command("/profile"));
         assert!(is_untargeted_bot_command("/sources"));
         assert!(is_untargeted_bot_command("/status"));
+        assert!(is_untargeted_bot_command("/jobs"));
         assert!(is_untargeted_bot_command("/cancel"));
         assert!(!is_untargeted_bot_command("/ask@OtherBot 问题"));
         assert!(!is_untargeted_bot_command("普通问题"));
@@ -724,8 +736,15 @@ mod tests {
     fn does_not_stream_lightweight_commands() {
         assert!(!should_stream_text("/sources"));
         assert!(!should_stream_text("/status"));
+        assert!(!should_stream_text("/jobs"));
         assert!(!should_stream_text("/cancel"));
         assert!(should_stream_text("/ask 问题"));
+    }
+
+    #[test]
+    fn only_plain_cancel_targets_active_chat_job() {
+        assert!(is_dispatcher_cancel_command("/cancel"));
+        assert!(!is_dispatcher_cancel_command("/cancel 12"));
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde_json::{Value, json};
+
+use crate::schemas::author_profile::AuthorProfileV1;
 
 use super::json_utils::parse_json_object;
 use super::llm::OpenAiCompatibleClient;
@@ -30,6 +32,7 @@ pub fn build_author_profile(
         object
             .entry("keyword_overview")
             .or_insert(deterministic["keyword_overview"].clone());
+        object.entry("repair_count").or_insert(0.into());
     }
     if let Err(error) = validate_author_profile(author, &profile) {
         let repaired = llm.chat(
@@ -46,6 +49,7 @@ pub fn build_author_profile(
             object
                 .entry("keyword_overview")
                 .or_insert(deterministic["keyword_overview"].clone());
+            object.insert("repair_count".to_string(), 1.into());
         }
         validate_author_profile(author, &profile)?;
     }
@@ -53,29 +57,7 @@ pub fn build_author_profile(
 }
 
 fn validate_author_profile(author: &str, profile: &Value) -> Result<()> {
-    let actual_author = profile
-        .get("author")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("AuthorProfileV1 missing author"))?;
-    if actual_author.trim().is_empty() {
-        return Err(anyhow!("AuthorProfileV1 author is empty"));
-    }
-    if actual_author != author {
-        return Err(anyhow!(
-            "AuthorProfileV1 author mismatch: expected {author}, got {actual_author}"
-        ));
-    }
-    let has_scope = profile
-        .get("answer_scope")
-        .or_else(|| profile.get("keyword_overview"))
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty());
-    if !has_scope {
-        return Err(anyhow!(
-            "AuthorProfileV1 missing non-empty answer_scope or keyword_overview"
-        ));
-    }
-    Ok(())
+    AuthorProfileV1::from_value(profile.clone())?.validate(author)
 }
 
 fn deterministic_profile(author: &str, profiles: &[Value]) -> Value {
