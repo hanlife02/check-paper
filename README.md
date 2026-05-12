@@ -2,10 +2,10 @@
 
 `check-paper` 用来分析 `paper/{作者}/{论文目录}/article.md` 中的本地论文库，并通过 LLM 和 Telegram bot 做可追溯问答。
 
-第一版采用两层结构：
+当前采用两层结构：
 
 1. 离线理解层：扫描新增或变更论文，清洗正文，分块入库，并调用 LLM 生成每篇论文的结构化理解。
-2. 问答层：优先使用论文理解回答；当问题需要具体证据、数值或理解层不足时，回到原文 chunk 检索。
+2. 问答层：优先使用论文理解回答；当问题需要具体证据、数值或理解层不足时，回到原文 chunk 检索，并可结合 FTS、事实、画像和向量路由做混合检索。
 
 ## 配置
 
@@ -37,7 +37,15 @@ ppc llm config
 ppc tg config
 ```
 
-这些配置命令会逐项提示输入，例如 `ppc config` 会依次询问 `db-path`、`default-author`、`proxy`。`proxy` 可选，格式例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`，会用于 LLM 和 Telegram 请求。`ppc llm config` 会依次询问 `base-url`、`api-key`、`model`、`timeout-secs`，默认 LLM 请求超时为 180 秒。`ppc tg config` 会询问 `bot-token` 和可选的 `chat-ids`；多个 chat id 用英文逗号分隔，不填则不限制聊天。
+这些配置命令会逐项提示输入，例如 `ppc config` 会依次询问 `db-path`、`default-author`、`proxy`。`default-author` 可留空，之后在命令里用 `--author` 指定作者。`proxy` 可选，格式例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`，会用于 LLM、Embedding 和 Telegram 请求。
+
+`ppc llm config` 会依次询问 `base-url`、`api-key`、`model`、`timeout-secs`、`tls-backend` 和可选的 token 成本参数。默认 LLM 请求超时为 180 秒，`tls-backend` 可选 `rustls` 或 `native`。配置后可以用小请求检查连通性：
+
+```bash
+ppc llm check
+```
+
+`ppc tg config` 会询问 `bot-token` 和可选的 `chat-ids`；多个 chat id 用英文逗号分隔，不填则不限制聊天。
 
 查看配置：
 
@@ -51,12 +59,24 @@ ppc tg config --show
 
 `CHECK_PAPER_LLM_BASE_URL` 支持 OpenAI-compatible `/chat/completions` 接口。
 
+向量检索默认关闭。需要启用远端 OpenAI-compatible embeddings 时，设置：
+
+```bash
+CHECK_PAPER_EMBEDDING_PROVIDER=openai-compatible
+CHECK_PAPER_EMBEDDING_BASE_URL=https://api.openai.com/v1
+CHECK_PAPER_EMBEDDING_API_KEY=...
+CHECK_PAPER_EMBEDDING_MODEL=...
+```
+
+可选项包括 `CHECK_PAPER_EMBEDDING_MODEL_VERSION`、`CHECK_PAPER_EMBEDDING_TIMEOUT_SECS`、`CHECK_PAPER_EMBEDDING_TLS_BACKEND`、`CHECK_PAPER_EMBEDDING_BATCH_SIZE`。
+
 ## 常用命令
 
 ```bash
 ppc scan --author "Ruqiang ZOU"
 ppc ingest --author "Ruqiang ZOU"
 ppc analyze --author "Ruqiang ZOU" --limit 5
+ppc embed --author "Ruqiang ZOU"
 ppc ask --author "Ruqiang ZOU" "这个人的主要研究贡献是什么？"
 ppc serve-telegram
 ```
@@ -69,19 +89,58 @@ ppc sync --author "Ruqiang ZOU"
 
 `ppc sync` 会显示入库和分析进度。分析阶段每篇论文都会显示独立的处理进度，当前论文完成后再进入下一篇；每篇论文会自动重试，单篇失败会记录后继续处理后续论文，最后汇总失败列表。之后重新运行 `ppc sync` 会继续重试未成功分析的论文。
 
+分析和维护常用参数：
+
+```bash
+ppc analyze --author "Ruqiang ZOU" --failed-only
+ppc analyze --author "Ruqiang ZOU" --stale-only
+ppc analyze --author "Ruqiang ZOU" --force --skip-author-profile
+ppc profile --author "Ruqiang ZOU"
+ppc profile --author "Ruqiang ZOU" --rebuild
+```
+
+任务、状态和日志：
+
+```bash
+ppc status --author "Ruqiang ZOU"
+ppc jobs --author "Ruqiang ZOU" --status failed
+ppc jobs --author "Ruqiang ZOU" --retry-failed
+ppc jobs --cancel 123
+ppc logs qa --author "Ruqiang ZOU" --last 20
+ppc logs qa --errors
+ppc logs jobs --failed
+ppc logs jobs --errors
+```
+
+评测：
+
+```bash
+ppc eval --fixture tests/fixtures/golden_questions.json --top-k 8
+ppc eval --fixture tests/fixtures/golden_questions.json --trace
+```
+
 ## Telegram 用法
 
 ```text
 /start
+/use_author Ruqiang ZOU
+/current_author
 /profile
 /profile Ruqiang ZOU
+/status
+/status detail
+/jobs
+/jobs failed
+/sources
+/sources full
+/cancel job_id
 /ask 这个人的 MOF 相关成果有哪些？
 /ask Ruqiang ZOU | 固态电池方向有什么代表性论文？
 ```
 
-如果没有在命令中指定作者，bot 会使用 `CHECK_PAPER_DEFAULT_AUTHOR`。
+如果没有在命令中指定作者，bot 会优先使用当前 chat 通过 `/use_author` 设置的作者；未设置时使用 `CHECK_PAPER_DEFAULT_AUTHOR`。私聊中设置默认作者后，可以直接发送问题。
 
-私聊中可以直接发送命令或问题。群聊中需要艾特 bot 才会响应，例如：
+群聊中需要艾特 bot 才会响应，例如：
 
 ```text
 @你的Bot用户名 这篇论文讲什么？
@@ -103,5 +162,8 @@ data/check_paper.sqlite
 - 论文元数据和 source hash
 - 清洗后的正文 chunk
 - FTS 检索索引
+- chunk embedding 和 embedding 版本信息
 - 每篇论文的 LLM 理解 JSON
 - 作者级聚合画像 JSON
+- 分析任务队列、任务状态历史和失败原因
+- QA 日志、引用快照、token 用量和估算成本
