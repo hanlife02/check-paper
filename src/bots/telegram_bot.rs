@@ -106,7 +106,7 @@ impl TelegramBot {
                     eprintln!("Telegram update {} ignored: {reason}", update.update_id);
                     continue;
                 }
-                let text = strip_bot_mention(text, bot_username.as_deref());
+                let text = handler_text_after_bot_mention(text, bot_username.as_deref());
                 if is_dispatcher_cancel_command(text.trim()) {
                     match dispatcher.cancel(message.chat.id) {
                         DispatchAction::Cancelled { active_job_id, .. } => {
@@ -625,6 +625,17 @@ fn strip_bot_mention(text: &str, bot_username: Option<&str>) -> String {
         .join(" ")
 }
 
+fn handler_text_after_bot_mention(text: &str, bot_username: Option<&str>) -> String {
+    let stripped = strip_bot_mention(text, bot_username);
+    if stripped.trim().is_empty()
+        && bot_username.is_some_and(|username| mentions_bot(text, username))
+    {
+        "/help".to_string()
+    } else {
+        stripped
+    }
+}
+
 fn token_has_bot_mention(token: &str, mention: &str) -> bool {
     strip_token_bot_mention(token, mention) != token
 }
@@ -650,8 +661,9 @@ fn is_command_boundary(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_MESSAGE_CHARS, is_dispatcher_cancel_command, mentions_bot, should_stream_text,
-        strip_bot_mention, telegram_message_pages, telegram_retry_after,
+        TELEGRAM_MAX_MESSAGE_CHARS, handler_text_after_bot_mention, is_dispatcher_cancel_command,
+        mentions_bot, should_stream_text, strip_bot_mention, telegram_message_pages,
+        telegram_retry_after,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -697,6 +709,26 @@ mod tests {
         assert_eq!(
             strip_bot_mention("这篇论文讲什么 @PaperCheckBot", Some("PaperCheckBot")),
             "这篇论文讲什么"
+        );
+    }
+
+    #[test]
+    fn bare_bot_mention_routes_to_help() {
+        assert_eq!(
+            handler_text_after_bot_mention("@PaperCheckBot", Some("PaperCheckBot")),
+            "/help"
+        );
+        assert_eq!(
+            handler_text_after_bot_mention("@PaperCheckBot   ", Some("PaperCheckBot")),
+            "/help"
+        );
+        assert_eq!(
+            handler_text_after_bot_mention("@PaperCheckBot /status", Some("PaperCheckBot")),
+            "/status"
+        );
+        assert_eq!(
+            handler_text_after_bot_mention("plain text", Some("PaperCheckBot")),
+            "plain text"
         );
     }
 
