@@ -141,7 +141,7 @@ ppc eval --fixture tests/fixtures/golden_questions.json --trace
 /ask Ruqiang ZOU | 固态电池方向有什么代表性论文？
 ```
 
-`/authors` 和不带参数的 `/use_author` 会列出当前数据库中已经入库的作者，并提示回复序号选择作者，例如回复 `1`。如果直接提问但当前 chat 没有默认作者，bot 也会先列出作者；选中后会继续回答刚才的问题。
+`/authors` 和不带参数的 `/use_author` 会列出当前数据库中已经入库的作者，并提示回复序号选择作者，例如回复 `1`。群聊中选择序号也需要艾特 bot，例如 `@你的Bot用户名 1`。如果直接提问但当前 chat 没有默认作者，bot 也会先列出作者；选中后会继续回答刚才的问题。
 
 如果没有在命令中指定作者，bot 会优先使用当前 chat 通过 `/use_author` 或 `/authors` 设置的作者；未设置时使用 `CHECK_PAPER_DEFAULT_AUTHOR`。私聊中设置默认作者后，可以直接发送问题。
 

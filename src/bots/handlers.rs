@@ -586,7 +586,9 @@ fn format_author_choices(
     if has_more {
         lines.push(format!("仅显示前 {AUTHOR_CHOICE_LIMIT} 位作者。"));
     }
-    lines.push("回复序号选择作者，例如 `1`。".to_string());
+    lines.push(
+        "回复序号选择作者，例如 `1`；群聊中也需要 @ bot，例如 `@你的Bot用户名 1`。".to_string(),
+    );
     lines.join("\n")
 }
 
