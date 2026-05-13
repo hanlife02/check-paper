@@ -10,9 +10,28 @@ use crate::retrieval::embedding::{
     LOCAL_HASH_EMBEDDING_DIM, LOCAL_HASH_EMBEDDING_MODEL, encode_f32_vector, local_hash_embedding,
 };
 
-use super::{AnalysisCandidate, LibraryStatus, Storage};
+use super::{AnalysisCandidate, AuthorSummary, LibraryStatus, Storage};
 
 impl Storage {
+    pub fn authors(&self) -> Result<Vec<AuthorSummary>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT author, COUNT(*) AS paper_count
+            FROM papers
+            GROUP BY author
+            ORDER BY author COLLATE NOCASE
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AuthorSummary {
+                author: row.get(0)?,
+                paper_count: row.get(1)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn upsert_paper(&mut self, paper: &Paper, chunks: &[Chunk]) -> Result<bool> {
         self.upsert_paper_with_chunker(paper, chunks, "section-char-v1", 3200, 350)
     }

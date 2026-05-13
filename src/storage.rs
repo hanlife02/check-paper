@@ -47,6 +47,12 @@ pub struct Storage {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorSummary {
+    pub author: String,
+    pub paper_count: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LibraryStatus {
     pub papers: i64,
@@ -240,6 +246,39 @@ mod tests {
         let latest = storage.latest_qa_answer(Some("Alice")).unwrap().unwrap();
         assert_eq!(latest["answer"], "ok");
         assert_eq!(latest["evidence"][0]["chunk_id"], 1);
+    }
+
+    #[test]
+    fn lists_authors_with_paper_counts() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        for (paper_key, author, paper_id) in [
+            ("Alice/paper-a", "Alice", "paper-a"),
+            ("Alice/paper-b", "Alice", "paper-b"),
+            ("Bob/paper-a", "Bob", "paper-a"),
+        ] {
+            storage
+                .conn
+                .execute(
+                    r#"
+                    INSERT INTO papers (
+                        paper_key, author, paper_id, title, doi, year, source_hash,
+                        article_path, metadata_json, fetch_result_json
+                    )
+                    VALUES (?, ?, ?, 'A Paper', '', '2024', ?, 'article.md', '{}', '{}')
+                    "#,
+                    rusqlite::params![paper_key, author, paper_id, paper_key],
+                )
+                .unwrap();
+        }
+
+        let authors = storage.authors().unwrap();
+
+        assert_eq!(authors.len(), 2);
+        assert_eq!(authors[0].author, "Alice");
+        assert_eq!(authors[0].paper_count, 2);
+        assert_eq!(authors[1].author, "Bob");
+        assert_eq!(authors[1].paper_count, 1);
     }
 
     #[test]

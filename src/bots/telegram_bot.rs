@@ -448,6 +448,7 @@ fn should_stream_text(text: &str) -> bool {
     let stripped = text.trim();
     !stripped.starts_with("/start")
         && !stripped.starts_with("/help")
+        && !stripped.starts_with("/authors")
         && !stripped.starts_with("/profile")
         && !stripped.starts_with("/sources")
         && !stripped.starts_with("/status")
@@ -692,6 +693,7 @@ mod tests {
     #[test]
     fn bare_group_commands_do_not_count_as_mentions() {
         assert!(!mentions_bot("/ask 问题", "PaperCheckBot"));
+        assert!(!mentions_bot("/authors", "PaperCheckBot"));
         assert!(!mentions_bot("/profile", "PaperCheckBot"));
         assert!(!mentions_bot("/sources", "PaperCheckBot"));
         assert!(!mentions_bot("/status", "PaperCheckBot"));
@@ -756,6 +758,7 @@ mod tests {
     fn does_not_stream_lightweight_commands() {
         assert!(!should_stream_text("/sources"));
         assert!(!should_stream_text("/help"));
+        assert!(!should_stream_text("/authors"));
         assert!(!should_stream_text("/status"));
         assert!(!should_stream_text("/jobs"));
         assert!(!should_stream_text("/cancel"));

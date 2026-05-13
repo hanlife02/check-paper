@@ -10,10 +10,11 @@ use crate::services::profile::{AuthorProfileLookup, ProfileService};
 use crate::services::qa::QaService;
 use crate::services::sources::SourcesService;
 use crate::services::status::StatusService;
-use crate::storage::{AnalysisJobSummary, LibraryStatus, Storage};
+use crate::storage::{AnalysisJobSummary, AuthorSummary, LibraryStatus, Storage};
 use crate::understanding::llm::OpenAiCompatibleClient;
 
 const MAX_TELEGRAM_USER_TEXT_CHARS: usize = 4000;
+const AUTHOR_CHOICE_LIMIT: usize = 30;
 
 #[derive(Clone)]
 pub struct BotHandlers {
@@ -22,6 +23,24 @@ pub struct BotHandlers {
     embedding: Option<OpenAiCompatibleEmbeddingClient>,
     default_author: Option<String>,
     chat_authors: Arc<Mutex<HashMap<i64, String>>>,
+    pending_author_choices: Arc<Mutex<HashMap<i64, PendingAuthorSelection>>>,
+}
+
+#[derive(Clone)]
+struct PendingAuthorSelection {
+    authors: Vec<String>,
+    action: PendingAuthorAction,
+}
+
+#[derive(Clone)]
+enum PendingAuthorAction {
+    SetDefault,
+    Ask { question: String },
+}
+
+enum AuthorSelectionOutcome {
+    Message(String),
+    Ask { author: String, question: String },
 }
 
 impl BotHandlers {
@@ -37,6 +56,7 @@ impl BotHandlers {
             embedding,
             default_author,
             chat_authors: Arc::new(Mutex::new(HashMap::new())),
+            pending_author_choices: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -49,16 +69,29 @@ impl BotHandlers {
                 "消息过长，请控制在 {MAX_TELEGRAM_USER_TEXT_CHARS} 个字符以内。"
             ));
         }
+        if let Some(outcome) = self.resolve_pending_author_selection(chat_id, stripped)? {
+            return self.reply_for_author_selection(&qa, outcome);
+        }
         if stripped.starts_with("/start") {
             return Ok(start_message());
         }
         if stripped.starts_with("/help") {
             return Ok(help_message());
         }
+        if stripped.starts_with("/authors") {
+            let outcome =
+                self.start_author_selection(&storage, chat_id, PendingAuthorAction::SetDefault)?;
+            return self.reply_for_author_selection(&qa, outcome);
+        }
         if stripped.starts_with("/use_author") {
             let author = stripped.trim_start_matches("/use_author").trim();
             if author.is_empty() {
-                return Ok("请指定作者，例如 `/use_author Ruqiang ZOU`。".to_string());
+                let outcome = self.start_author_selection(
+                    &storage,
+                    chat_id,
+                    PendingAuthorAction::SetDefault,
+                )?;
+                return self.reply_for_author_selection(&qa, outcome);
             }
             self.set_chat_author(chat_id, author)?;
             return Ok(format!("当前 chat 默认作者已设置为：{author}"));
@@ -99,15 +132,11 @@ impl BotHandlers {
         }
         if stripped.starts_with("/ask") {
             let body = stripped.trim_start_matches("/ask").trim();
-            let (author, question) = self.parse_author_question(chat_id, body)?;
-            return qa.answer(&author, &question);
+            let outcome = self.resolve_author_question(&storage, chat_id, body)?;
+            return self.reply_for_author_selection(&qa, outcome);
         }
-        let Some(author) = self.chat_author(chat_id) else {
-            return Ok(
-                "请先设置 CHECK_PAPER_DEFAULT_AUTHOR，或使用 `/ask 作者 | 问题`。".to_string(),
-            );
-        };
-        qa.answer(&author, stripped)
+        let outcome = self.resolve_plain_question(&storage, chat_id, stripped)?;
+        self.reply_for_author_selection(&qa, outcome)
     }
 
     pub async fn handle_text_stream<F>(
@@ -127,16 +156,35 @@ impl BotHandlers {
                 "消息过长，请控制在 {MAX_TELEGRAM_USER_TEXT_CHARS} 个字符以内。"
             ));
         }
+        if let Some(outcome) = self.resolve_pending_author_selection(chat_id, stripped)? {
+            return self
+                .reply_for_author_selection_stream(&qa, outcome, on_delta)
+                .await;
+        }
         if stripped.starts_with("/start") {
             return Ok(start_message());
         }
         if stripped.starts_with("/help") {
             return Ok(help_message());
         }
+        if stripped.starts_with("/authors") {
+            let outcome =
+                self.start_author_selection(&storage, chat_id, PendingAuthorAction::SetDefault)?;
+            return self
+                .reply_for_author_selection_stream(&qa, outcome, on_delta)
+                .await;
+        }
         if stripped.starts_with("/use_author") {
             let author = stripped.trim_start_matches("/use_author").trim();
             if author.is_empty() {
-                return Ok("请指定作者，例如 `/use_author Ruqiang ZOU`。".to_string());
+                let outcome = self.start_author_selection(
+                    &storage,
+                    chat_id,
+                    PendingAuthorAction::SetDefault,
+                )?;
+                return self
+                    .reply_for_author_selection_stream(&qa, outcome, on_delta)
+                    .await;
             }
             self.set_chat_author(chat_id, author)?;
             return Ok(format!("当前 chat 默认作者已设置为：{author}"));
@@ -177,15 +225,14 @@ impl BotHandlers {
         }
         if stripped.starts_with("/ask") {
             let body = stripped.trim_start_matches("/ask").trim();
-            let (author, question) = self.parse_author_question(chat_id, body)?;
-            return qa.answer_stream(&author, &question, on_delta).await;
+            let outcome = self.resolve_author_question(&storage, chat_id, body)?;
+            return self
+                .reply_for_author_selection_stream(&qa, outcome, on_delta)
+                .await;
         }
-        let Some(author) = self.chat_author(chat_id) else {
-            return Ok(
-                "请先设置 CHECK_PAPER_DEFAULT_AUTHOR，或使用 `/ask 作者 | 问题`。".to_string(),
-            );
-        };
-        qa.answer_stream(&author, stripped, on_delta).await
+        let outcome = self.resolve_plain_question(&storage, chat_id, stripped)?;
+        self.reply_for_author_selection_stream(&qa, outcome, on_delta)
+            .await
     }
 
     fn profile(&self, storage: &Storage, author: Option<&str>) -> Result<String> {
@@ -235,23 +282,180 @@ impl BotHandlers {
         Ok(format!("已取消任务 #{job_id}。"))
     }
 
-    fn parse_author_question(&self, chat_id: i64, body: &str) -> Result<(String, String)> {
+    fn reply_for_author_selection(
+        &self,
+        qa: &QaService<'_>,
+        outcome: AuthorSelectionOutcome,
+    ) -> Result<String> {
+        match outcome {
+            AuthorSelectionOutcome::Message(message) => Ok(message),
+            AuthorSelectionOutcome::Ask { author, question } => qa.answer(&author, &question),
+        }
+    }
+
+    async fn reply_for_author_selection_stream<F>(
+        &self,
+        qa: &QaService<'_>,
+        outcome: AuthorSelectionOutcome,
+        on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        match outcome {
+            AuthorSelectionOutcome::Message(message) => Ok(message),
+            AuthorSelectionOutcome::Ask { author, question } => {
+                qa.answer_stream(&author, &question, on_delta).await
+            }
+        }
+    }
+
+    fn resolve_author_question(
+        &self,
+        storage: &Storage,
+        chat_id: i64,
+        body: &str,
+    ) -> Result<AuthorSelectionOutcome> {
         if let Some((author, question)) = body.split_once('|') {
             let author = author.trim();
             let question = question.trim();
             if !author.is_empty() && !question.is_empty() {
-                return Ok((author.to_string(), question.to_string()));
+                return Ok(AuthorSelectionOutcome::Ask {
+                    author: author.to_string(),
+                    question: question.to_string(),
+                });
             }
+            return Err(anyhow!("请使用 `/ask 作者 | 问题`。"));
         }
-        let Some(author) = self.chat_author(chat_id) else {
-            return Err(anyhow!(
-                "请使用 `/ask 作者 | 问题`，或设置 CHECK_PAPER_DEFAULT_AUTHOR。"
-            ));
-        };
         if body.trim().is_empty() {
             return Err(anyhow!("请在 /ask 后输入问题。"));
         }
-        Ok((author, body.trim().to_string()))
+        if let Some(author) = self.chat_author(chat_id) {
+            return Ok(AuthorSelectionOutcome::Ask {
+                author,
+                question: body.trim().to_string(),
+            });
+        }
+        self.start_author_selection(
+            storage,
+            chat_id,
+            PendingAuthorAction::Ask {
+                question: body.trim().to_string(),
+            },
+        )
+    }
+
+    fn resolve_plain_question(
+        &self,
+        storage: &Storage,
+        chat_id: i64,
+        question: &str,
+    ) -> Result<AuthorSelectionOutcome> {
+        if let Some(author) = self.chat_author(chat_id) {
+            return Ok(AuthorSelectionOutcome::Ask {
+                author,
+                question: question.to_string(),
+            });
+        }
+        self.start_author_selection(
+            storage,
+            chat_id,
+            PendingAuthorAction::Ask {
+                question: question.to_string(),
+            },
+        )
+    }
+
+    fn start_author_selection(
+        &self,
+        storage: &Storage,
+        chat_id: i64,
+        action: PendingAuthorAction,
+    ) -> Result<AuthorSelectionOutcome> {
+        let mut summaries = storage.authors()?;
+        if summaries.is_empty() {
+            return Ok(AuthorSelectionOutcome::Message(
+                "还没有入库作者。请先运行 `ppc ingest --author ...` 或 `ppc sync --author ...`。"
+                    .to_string(),
+            ));
+        }
+        let has_more = summaries.len() > AUTHOR_CHOICE_LIMIT;
+        summaries.truncate(AUTHOR_CHOICE_LIMIT);
+        if summaries.len() == 1 {
+            let author = summaries[0].author.clone();
+            self.set_chat_author(chat_id, &author)?;
+            return Ok(match action {
+                PendingAuthorAction::SetDefault => {
+                    AuthorSelectionOutcome::Message(format!("当前 chat 默认作者已设置为：{author}"))
+                }
+                PendingAuthorAction::Ask { question } => {
+                    AuthorSelectionOutcome::Ask { author, question }
+                }
+            });
+        }
+
+        let authors = summaries
+            .iter()
+            .map(|summary| summary.author.clone())
+            .collect::<Vec<_>>();
+        let mut pending = self
+            .pending_author_choices
+            .lock()
+            .map_err(|_| anyhow!("pending author selection state is unavailable"))?;
+        pending.insert(
+            chat_id,
+            PendingAuthorSelection {
+                authors,
+                action: action.clone(),
+            },
+        );
+        Ok(AuthorSelectionOutcome::Message(format_author_choices(
+            &summaries, &action, has_more,
+        )))
+    }
+
+    fn resolve_pending_author_selection(
+        &self,
+        chat_id: i64,
+        text: &str,
+    ) -> Result<Option<AuthorSelectionOutcome>> {
+        let Some(index) = parse_author_selection(text) else {
+            return Ok(None);
+        };
+        let selection = {
+            let pending = self
+                .pending_author_choices
+                .lock()
+                .map_err(|_| anyhow!("pending author selection state is unavailable"))?;
+            pending.get(&chat_id).cloned()
+        };
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        if index >= selection.authors.len() {
+            return Ok(Some(AuthorSelectionOutcome::Message(format!(
+                "请选择 1-{} 之间的序号。",
+                selection.authors.len()
+            ))));
+        }
+
+        {
+            let mut pending = self
+                .pending_author_choices
+                .lock()
+                .map_err(|_| anyhow!("pending author selection state is unavailable"))?;
+            pending.remove(&chat_id);
+        }
+        let author = selection.authors[index].clone();
+        self.set_chat_author(chat_id, &author)?;
+        Ok(Some(match selection.action {
+            PendingAuthorAction::SetDefault => {
+                AuthorSelectionOutcome::Message(format!("当前 chat 默认作者已设置为：{author}"))
+            }
+            PendingAuthorAction::Ask { question } => {
+                AuthorSelectionOutcome::Ask { author, question }
+            }
+        }))
     }
 
     fn parse_sources_args(&self, chat_id: i64, body: &str) -> (Option<String>, bool) {
@@ -317,6 +521,11 @@ impl BotHandlers {
             .lock()
             .map_err(|_| anyhow!("chat author state is unavailable"))?;
         authors.insert(chat_id, author.to_string());
+        let mut pending = self
+            .pending_author_choices
+            .lock()
+            .map_err(|_| anyhow!("pending author selection state is unavailable"))?;
+        pending.remove(&chat_id);
         Ok(())
     }
 
@@ -338,7 +547,8 @@ fn help_message() -> String {
         "Available commands:",
         "/help - Show this command list.",
         "/start - Confirm the bot is running.",
-        "/use_author NAME - Set the default author for this chat.",
+        "/authors - List available authors and select one by number.",
+        "/use_author [NAME] - Set or choose the default author for this chat.",
         "/current_author - Show the current default author.",
         "/profile [AUTHOR] - Show the author profile.",
         "/status [detail] [AUTHOR] - Show library and job status.",
@@ -350,6 +560,43 @@ fn help_message() -> String {
         "/ask AUTHOR | QUESTION - Ask about a specific author.",
     ]
     .join("\n")
+}
+
+fn format_author_choices(
+    summaries: &[AuthorSummary],
+    action: &PendingAuthorAction,
+    has_more: bool,
+) -> String {
+    let mut lines = match action {
+        PendingAuthorAction::SetDefault => {
+            vec!["请选择当前 chat 的默认作者：".to_string()]
+        }
+        PendingAuthorAction::Ask { .. } => {
+            vec!["请选择作者；选中后我会继续回答刚才的问题：".to_string()]
+        }
+    };
+    for (index, summary) in summaries.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} ({} papers)",
+            index + 1,
+            summary.author,
+            summary.paper_count
+        ));
+    }
+    if has_more {
+        lines.push(format!("仅显示前 {AUTHOR_CHOICE_LIMIT} 位作者。"));
+    }
+    lines.push("回复序号选择作者，例如 `1`。".to_string());
+    lines.join("\n")
+}
+
+fn parse_author_selection(text: &str) -> Option<usize> {
+    let text = text.trim();
+    if text.starts_with('/') {
+        return None;
+    }
+    let number = text.parse::<usize>().ok()?;
+    number.checked_sub(1)
 }
 
 fn format_status(
@@ -542,10 +789,18 @@ fn format_profile(profile: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::BTreeMap;
 
-    use super::{format_jobs, format_sources, format_status, help_message, normalize_job_status};
-    use crate::storage::{AnalysisJobSummary, LibraryStatus};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{
+        BotHandlers, PendingAuthorAction, format_author_choices, format_jobs, format_sources,
+        format_status, help_message, normalize_job_status, parse_author_selection,
+    };
+    use crate::papers::models::Paper;
+    use crate::storage::{AnalysisJobSummary, AuthorSummary, LibraryStatus};
+    use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
 
     #[test]
     fn help_lists_available_commands_with_purpose() {
@@ -553,8 +808,66 @@ mod tests {
 
         assert!(text.contains("Available commands:"));
         assert!(text.contains("/help - Show this command list."));
+        assert!(text.contains("/authors - List available authors and select one by number."));
+        assert!(text.contains("/use_author [NAME] - Set or choose the default author"));
         assert!(text.contains("/status [detail] [AUTHOR] - Show library and job status."));
         assert!(text.contains("/ask AUTHOR | QUESTION - Ask about a specific author."));
+    }
+
+    #[test]
+    fn formats_author_choices_with_numbered_selection() {
+        let text = format_author_choices(
+            &[
+                AuthorSummary {
+                    author: "Alice".to_string(),
+                    paper_count: 5,
+                },
+                AuthorSummary {
+                    author: "Bob".to_string(),
+                    paper_count: 2,
+                },
+            ],
+            &PendingAuthorAction::SetDefault,
+            false,
+        );
+
+        assert!(text.contains("请选择当前 chat 的默认作者："));
+        assert!(text.contains("1. Alice (5 papers)"));
+        assert!(text.contains("2. Bob (2 papers)"));
+        assert!(text.contains("回复序号选择作者"));
+    }
+
+    #[test]
+    fn parses_author_number_selection() {
+        assert_eq!(parse_author_selection("1"), Some(0));
+        assert_eq!(parse_author_selection(" 2 "), Some(1));
+        assert_eq!(parse_author_selection("/status"), None);
+        assert_eq!(parse_author_selection("Alice"), None);
+        assert_eq!(parse_author_selection("0"), None);
+    }
+
+    #[test]
+    fn use_author_without_argument_lists_and_accepts_number_selection() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite");
+        let mut storage = crate::storage::Storage::open(&db_path).unwrap();
+        storage
+            .upsert_paper(&test_paper(dir.path(), "Alice", "paper-a"), &[])
+            .unwrap();
+        storage
+            .upsert_paper(&test_paper(dir.path(), "Bob", "paper-a"), &[])
+            .unwrap();
+        drop(storage);
+        let handlers = BotHandlers::new(db_path, test_llm(), None, None);
+
+        let prompt = handlers.handle_text(7, "/use_author").unwrap();
+        let selected = handlers.handle_text(7, "2").unwrap();
+        let current = handlers.handle_text(7, "/current_author").unwrap();
+
+        assert!(prompt.contains("1. Alice (1 papers)"));
+        assert!(prompt.contains("2. Bob (1 papers)"));
+        assert_eq!(selected, "当前 chat 默认作者已设置为：Bob");
+        assert_eq!(current, "当前默认作者：Bob");
     }
 
     #[test]
@@ -678,5 +991,38 @@ mod tests {
         assert!(text.contains("QA 总成本：$0.012345"));
         assert!(text.contains("最近 failed 任务："));
         assert!(text.contains("#9 [failed] analyze Alice/paper-a"));
+    }
+
+    fn test_llm() -> OpenAiCompatibleClient {
+        OpenAiCompatibleClient::new(LlmConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: None,
+            model: "test-model".to_string(),
+            proxy: None,
+            timeout_secs: 1,
+            tls_backend: "rustls".to_string(),
+            prompt_cost_per_1k: None,
+            completion_cost_per_1k: None,
+        })
+        .unwrap()
+    }
+
+    fn test_paper(root: &std::path::Path, author: &str, paper_id: &str) -> Paper {
+        Paper {
+            author: author.to_string(),
+            paper_id: paper_id.to_string(),
+            paper_dir: root.join(author).join(paper_id),
+            article_path: root.join(author).join(paper_id).join("article.md"),
+            fetch_result_path: None,
+            source_hash: format!("{author}-{paper_id}-hash"),
+            metadata: BTreeMap::from([
+                ("title".to_string(), format!("{author} {paper_id}")),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            fetch_result: json!({}),
+            raw_body: String::new(),
+            clean_text: String::new(),
+            sections: vec![],
+        }
     }
 }
