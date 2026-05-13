@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Proxy;
+use reqwest::blocking::ClientBuilder;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -27,6 +30,8 @@ use crate::storage::{PaperProfileMetadata, Storage};
 use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
 use crate::understanding::paper_analyzer::{analyze_paper, extract_section_facts};
 use crate::understanding::prompts::PAPER_PROFILE_PROMPT_VERSION;
+
+const TELEGRAM_STATUS_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Parser)]
 #[command(version, about = "Analyze local paper archives and answer questions.")]
@@ -102,12 +107,35 @@ struct LlmConfigArgs {
 enum TgCommand {
     #[command(about = "Configure Telegram bot token and allowed chat IDs")]
     Config(TgConfigArgs),
+    #[command(about = "Check Telegram bot configuration and API connectivity")]
+    Status,
 }
 
 #[derive(Args)]
 struct TgConfigArgs {
     #[arg(long, help = "Print saved Telegram config values without prompting")]
     show: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramBotStatus {
+    id: i64,
+    username: Option<String>,
+    first_name: String,
+}
+
+#[derive(Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    result: Option<T>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramApiUser {
+    id: i64,
+    first_name: String,
+    username: Option<String>,
 }
 
 #[derive(Args)]
@@ -248,6 +276,10 @@ pub fn run() -> Result<()> {
         },
         Command::Tg { command } => match command {
             TgCommand::Config(args) => cmd_tg_config(args),
+            TgCommand::Status => {
+                let settings = Settings::from_sources();
+                cmd_tg_status(&settings)
+            }
         },
         command => {
             let settings = Settings::from_sources();
@@ -486,6 +518,110 @@ fn cmd_tg_config(args: TgConfigArgs) -> Result<()> {
     let path = save_config(&updates, None)?;
     println!("saved Telegram config to {}", path.display());
     Ok(())
+}
+
+fn cmd_tg_status(settings: &Settings) -> Result<()> {
+    let token = settings
+        .telegram_bot_token
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing TELEGRAM_BOT_TOKEN; run `ppc tg config`"))?;
+    let bot = telegram_get_me(token, settings.proxy.as_deref())?;
+    println!("{}", format_tg_status(settings, &bot));
+    Ok(())
+}
+
+fn telegram_get_me(token: &str, proxy: Option<&str>) -> Result<TelegramBotStatus> {
+    let mut builder =
+        ClientBuilder::new().timeout(Duration::from_secs(TELEGRAM_STATUS_TIMEOUT_SECS));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(Proxy::all(proxy)?);
+    }
+    let endpoint = format!("https://api.telegram.org/bot{token}/getMe");
+    let response = builder.build()?.get(&endpoint).send().map_err(|error| {
+        anyhow!(
+            "Telegram getMe request failed: {}",
+            redact_secret(&error.to_string(), token)
+        )
+    })?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| anyhow!("Telegram getMe response read failed: {error}"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Telegram getMe returned HTTP {status}: {}",
+            redact_secret(&body, token)
+        ));
+    }
+    let response: TelegramApiResponse<TelegramApiUser> =
+        serde_json::from_str(&body).map_err(|error| {
+            anyhow!(
+                "Telegram getMe response JSON parse failed: {error}; body: {}",
+                redact_secret(&body, token)
+            )
+        })?;
+    if !response.ok {
+        return Err(anyhow!(
+            "Telegram getMe failed: {}",
+            response
+                .description
+                .unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    let user = response
+        .result
+        .ok_or_else(|| anyhow!("Telegram getMe response missing result"))?;
+    Ok(TelegramBotStatus {
+        id: user.id,
+        username: user.username,
+        first_name: user.first_name,
+    })
+}
+
+fn format_tg_status(settings: &Settings, bot: &TelegramBotStatus) -> String {
+    let username = bot
+        .username
+        .as_deref()
+        .map(|username| format!("@{username}"))
+        .unwrap_or_else(|| "<no username>".to_string());
+    [
+        "Telegram status: ok".to_string(),
+        format!(
+            "bot: {} id={} first_name={}",
+            username, bot.id, bot.first_name
+        ),
+        format!(
+            "allowed_chats: {}",
+            format_cli_chat_ids(&settings.telegram_chat_ids)
+        ),
+        format!(
+            "proxy: {}",
+            settings.proxy.as_deref().unwrap_or("<not configured>")
+        ),
+        "api_check: getMe succeeded".to_string(),
+        "serve_command: ppc serve-telegram".to_string(),
+    ]
+    .join("\n")
+}
+
+fn format_cli_chat_ids(chat_ids: &[i64]) -> String {
+    if chat_ids.is_empty() {
+        "all".to_string()
+    } else {
+        chat_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "<redacted>")
+    }
 }
 
 fn prompt_value(name: &str, current: &str, secret: bool) -> Result<String> {
@@ -1126,7 +1262,10 @@ fn make_optional_embedding(settings: &Settings) -> Result<Option<OpenAiCompatibl
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AskArgs, cmd_ask, resolve_author};
+    use super::{
+        AskArgs, TelegramBotStatus, cmd_ask, format_cli_chat_ids, format_tg_status, redact_secret,
+        resolve_author,
+    };
     use crate::config::Settings;
 
     fn settings(default_author: Option<&str>) -> Settings {
@@ -1187,5 +1326,36 @@ mod tests {
         .to_string();
 
         assert!(err.contains("missing question"));
+    }
+
+    #[test]
+    fn formats_tg_status_without_secrets() {
+        let mut settings = settings(None);
+        settings.telegram_chat_ids = vec![-1003854490002];
+        settings.proxy = Some("socks5://127.0.0.1:7890".to_string());
+        let text = format_tg_status(
+            &settings,
+            &TelegramBotStatus {
+                id: 42,
+                username: Some("ppc_ethan_bot".to_string()),
+                first_name: "ppc".to_string(),
+            },
+        );
+
+        assert!(text.contains("Telegram status: ok"));
+        assert!(text.contains("bot: @ppc_ethan_bot id=42 first_name=ppc"));
+        assert!(text.contains("allowed_chats: -1003854490002"));
+        assert!(text.contains("proxy: socks5://127.0.0.1:7890"));
+        assert!(text.contains("serve_command: ppc serve-telegram"));
+    }
+
+    #[test]
+    fn formats_tg_status_chat_ids_and_redacts_token() {
+        assert_eq!(format_cli_chat_ids(&[]), "all");
+        assert_eq!(format_cli_chat_ids(&[1, -2]), "1,-2");
+        assert_eq!(
+            redact_secret("https://api.telegram.org/bot123:secret/getMe", "123:secret"),
+            "https://api.telegram.org/bot<redacted>/getMe"
+        );
     }
 }

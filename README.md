@@ -53,7 +53,10 @@ ppc llm check
 ppc config --show
 ppc llm config --show
 ppc tg config --show
+ppc tg status
 ```
+
+`ppc tg status` 会检查 Telegram bot token、允许的 chat id、代理配置，以及 Telegram `getMe` API 连通性。它用于确认 bot 配置和 Telegram API 是否可达；实际轮询服务仍由 `ppc serve-telegram` 启动。
 
 `.paper-check.json` 已加入 `.gitignore`。环境变量仍然可用，并且优先级高于本地配置文件。`CHECK_PAPER_PAPER_ROOT` 不需要配置，默认读取当前目录下的 `paper/`。
 
