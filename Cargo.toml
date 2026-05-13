@@ -1,6 +1,6 @@
 [package]
 name = "paper-check"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 description = "Analyze a researcher's local paper archive and answer questions with LLM-backed retrieval."
 

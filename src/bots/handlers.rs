@@ -52,6 +52,9 @@ impl BotHandlers {
         if stripped.starts_with("/start") {
             return Ok(start_message());
         }
+        if stripped.starts_with("/help") {
+            return Ok(help_message());
+        }
         if stripped.starts_with("/use_author") {
             let author = stripped.trim_start_matches("/use_author").trim();
             if author.is_empty() {
@@ -126,6 +129,9 @@ impl BotHandlers {
         }
         if stripped.starts_with("/start") {
             return Ok(start_message());
+        }
+        if stripped.starts_with("/help") {
+            return Ok(help_message());
         }
         if stripped.starts_with("/use_author") {
             let author = stripped.trim_start_matches("/use_author").trim();
@@ -324,7 +330,26 @@ impl BotHandlers {
 }
 
 fn start_message() -> String {
-    "check-paper 已启动。\n用法：\n/use_author Ruqiang ZOU\n/current_author\n/profile\n/status\n/status detail\n/jobs\n/jobs failed\n/sources\n/sources full\n/cancel\n/cancel job_id\n/ask 你的问题\n/ask Ruqiang ZOU | 你的问题".to_string()
+    "check-paper 已启动。使用 /help 查看可用命令。".to_string()
+}
+
+fn help_message() -> String {
+    [
+        "Available commands:",
+        "/help - Show this command list.",
+        "/start - Confirm the bot is running.",
+        "/use_author NAME - Set the default author for this chat.",
+        "/current_author - Show the current default author.",
+        "/profile [AUTHOR] - Show the author profile.",
+        "/status [detail] [AUTHOR] - Show library and job status.",
+        "/jobs [STATUS] [AUTHOR] - Show recent analysis jobs.",
+        "/sources [full] - Show sources from the last answer.",
+        "/cancel - Cancel the current answer.",
+        "/cancel JOB_ID - Cancel an analysis job.",
+        "/ask QUESTION - Ask about the current author.",
+        "/ask AUTHOR | QUESTION - Ask about a specific author.",
+    ]
+    .join("\n")
 }
 
 fn format_status(
@@ -519,8 +544,18 @@ fn format_profile(profile: &Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{format_jobs, format_sources, format_status, normalize_job_status};
+    use super::{format_jobs, format_sources, format_status, help_message, normalize_job_status};
     use crate::storage::{AnalysisJobSummary, LibraryStatus};
+
+    #[test]
+    fn help_lists_available_commands_with_purpose() {
+        let text = help_message();
+
+        assert!(text.contains("Available commands:"));
+        assert!(text.contains("/help - Show this command list."));
+        assert!(text.contains("/status [detail] [AUTHOR] - Show library and job status."));
+        assert!(text.contains("/ask AUTHOR | QUESTION - Ask about a specific author."));
+    }
 
     #[test]
     fn formats_structured_sources() {

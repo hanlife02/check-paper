@@ -123,6 +123,7 @@ ppc eval --fixture tests/fixtures/golden_questions.json --trace
 
 ```text
 /start
+/help
 /use_author Ruqiang ZOU
 /current_author
 /profile

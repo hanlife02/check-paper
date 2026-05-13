@@ -447,6 +447,7 @@ async fn stream_message_updates(
 fn should_stream_text(text: &str) -> bool {
     let stripped = text.trim();
     !stripped.starts_with("/start")
+        && !stripped.starts_with("/help")
         && !stripped.starts_with("/profile")
         && !stripped.starts_with("/sources")
         && !stripped.starts_with("/status")
@@ -722,6 +723,7 @@ mod tests {
     #[test]
     fn does_not_stream_lightweight_commands() {
         assert!(!should_stream_text("/sources"));
+        assert!(!should_stream_text("/help"));
         assert!(!should_stream_text("/status"));
         assert!(!should_stream_text("/jobs"));
         assert!(!should_stream_text("/cancel"));
