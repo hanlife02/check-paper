@@ -26,7 +26,7 @@ use crate::services::jobs::JobService;
 use crate::services::profile::{AuthorProfileLookup, AuthorProfileRebuild, ProfileService};
 use crate::services::qa::QaService;
 use crate::services::status::StatusService;
-use crate::storage::{PaperProfileMetadata, Storage};
+use crate::storage::{AuthorSummary, PaperProfileMetadata, Storage};
 use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
 use crate::understanding::paper_analyzer::{analyze_paper, extract_section_facts};
 use crate::understanding::prompts::PAPER_PROFILE_PROMPT_VERSION;
@@ -54,6 +54,8 @@ enum Command {
         #[command(subcommand)]
         command: TgCommand,
     },
+    #[command(about = "List authors already ingested into the database")]
+    Authors,
     #[command(about = "List local paper directories")]
     Scan(AuthorArgs),
     #[command(about = "Parse papers, chunk text, and update the database")]
@@ -286,6 +288,7 @@ pub fn run() -> Result<()> {
             settings.ensure_dirs()?;
             match command {
                 Command::Scan(args) => cmd_scan(args, &settings),
+                Command::Authors => cmd_authors(&settings),
                 Command::Ingest(args) => cmd_ingest(args, &settings),
                 Command::Analyze(args) => cmd_analyze(args, &settings),
                 Command::Sync(args) => {
@@ -708,6 +711,41 @@ fn display_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+fn cmd_authors(settings: &Settings) -> Result<()> {
+    let storage = Storage::open(&settings.db_path)?;
+    let authors = storage.authors()?;
+    println!(
+        "{}",
+        format_authors(&authors, settings.default_author.as_deref())
+    );
+    Ok(())
+}
+
+fn format_authors(authors: &[AuthorSummary], default_author: Option<&str>) -> String {
+    if authors.is_empty() {
+        return "no authors in database; run `ppc ingest --author AUTHOR` or `ppc sync --author AUTHOR` first".to_string();
+    }
+    let mut lines = vec![format!("authors: {}", authors.len())];
+    for (index, author) in authors.iter().enumerate() {
+        let default_marker = if Some(author.author.as_str()) == default_author {
+            " default"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "{}. {} ({} papers{})",
+            index + 1,
+            author.author,
+            author.paper_count,
+            default_marker
+        ));
+    }
+    lines.push(
+        "Use one with `--author \"NAME\"`, or set it as default with `ppc config`.".to_string(),
+    );
+    lines.join("\n")
 }
 
 fn cmd_scan(args: AuthorArgs, settings: &Settings) -> Result<()> {
@@ -1189,7 +1227,9 @@ fn resolve_author(author: Option<&str>, settings: &Settings) -> Result<String> {
     author
         .map(str::to_string)
         .or_else(|| settings.default_author.clone())
-        .ok_or_else(|| anyhow!("missing author; pass --author or run `ppc config`"))
+        .ok_or_else(|| {
+            anyhow!("missing author; pass --author, run `ppc authors`, or set a default with `ppc config`")
+        })
 }
 
 fn require_llm(settings: &Settings) -> Result<()> {
@@ -1263,10 +1303,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        AskArgs, TelegramBotStatus, cmd_ask, format_cli_chat_ids, format_tg_status, redact_secret,
-        resolve_author,
+        AskArgs, TelegramBotStatus, cmd_ask, format_authors, format_cli_chat_ids, format_tg_status,
+        redact_secret, resolve_author,
     };
     use crate::config::Settings;
+    use crate::storage::AuthorSummary;
 
     fn settings(default_author: Option<&str>) -> Settings {
         Settings {
@@ -1304,6 +1345,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing author"));
+        assert!(err.contains("ppc authors"));
         assert_eq!(
             resolve_author(Some("Alice"), &without_default).unwrap(),
             "Alice"
@@ -1326,6 +1368,36 @@ mod tests {
         .to_string();
 
         assert!(err.contains("missing question"));
+    }
+
+    #[test]
+    fn formats_authors_with_default_marker() {
+        let text = format_authors(
+            &[
+                AuthorSummary {
+                    author: "Alice".to_string(),
+                    paper_count: 5,
+                },
+                AuthorSummary {
+                    author: "Bob".to_string(),
+                    paper_count: 2,
+                },
+            ],
+            Some("Bob"),
+        );
+
+        assert!(text.contains("authors: 2"));
+        assert!(text.contains("1. Alice (5 papers)"));
+        assert!(text.contains("2. Bob (2 papers default)"));
+        assert!(text.contains("--author \"NAME\""));
+    }
+
+    #[test]
+    fn formats_empty_authors_with_next_step() {
+        let text = format_authors(&[], None);
+
+        assert!(text.contains("no authors in database"));
+        assert!(text.contains("ppc ingest --author AUTHOR"));
     }
 
     #[test]
