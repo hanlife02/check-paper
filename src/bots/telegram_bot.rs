@@ -280,13 +280,11 @@ impl TelegramBot {
             return None;
         }
 
-        if bot_username.is_some_and(|username| mentions_bot(text, username))
-            || is_untargeted_bot_command(text)
-        {
+        if bot_username.is_some_and(|username| mentions_bot(text, username)) {
             return None;
         }
 
-        Some("group message must mention this bot or use /start, /profile, or /ask")
+        Some("group message must mention this bot")
     }
 
     async fn get_me(&self) -> Result<User> {
@@ -614,15 +612,6 @@ fn mentions_bot(text: &str, bot_username: &str) -> bool {
         .any(|word| token_has_bot_mention(word, &mention))
 }
 
-fn is_untargeted_bot_command(text: &str) -> bool {
-    matches!(
-        text.split_whitespace().next(),
-        Some("/start" | "/profile" | "/ask" | "/sources" | "/status" | "/jobs" | "/cancel")
-            | Some("/use_author")
-            | Some("/current_author")
-    )
-}
-
 fn strip_bot_mention(text: &str, bot_username: Option<&str>) -> String {
     let Some(bot_username) = bot_username else {
         return text.to_string();
@@ -660,9 +649,8 @@ fn is_command_boundary(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_MESSAGE_CHARS, is_dispatcher_cancel_command, is_untargeted_bot_command,
-        mentions_bot, should_stream_text, strip_bot_mention, telegram_message_pages,
-        telegram_retry_after,
+        TELEGRAM_MAX_MESSAGE_CHARS, is_dispatcher_cancel_command, mentions_bot, should_stream_text,
+        strip_bot_mention, telegram_message_pages, telegram_retry_after,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -689,15 +677,14 @@ mod tests {
     }
 
     #[test]
-    fn detects_untargeted_commands() {
-        assert!(is_untargeted_bot_command("/ask 问题"));
-        assert!(is_untargeted_bot_command("/profile"));
-        assert!(is_untargeted_bot_command("/sources"));
-        assert!(is_untargeted_bot_command("/status"));
-        assert!(is_untargeted_bot_command("/jobs"));
-        assert!(is_untargeted_bot_command("/cancel"));
-        assert!(!is_untargeted_bot_command("/ask@OtherBot 问题"));
-        assert!(!is_untargeted_bot_command("普通问题"));
+    fn bare_group_commands_do_not_count_as_mentions() {
+        assert!(!mentions_bot("/ask 问题", "PaperCheckBot"));
+        assert!(!mentions_bot("/profile", "PaperCheckBot"));
+        assert!(!mentions_bot("/sources", "PaperCheckBot"));
+        assert!(!mentions_bot("/status", "PaperCheckBot"));
+        assert!(!mentions_bot("/jobs", "PaperCheckBot"));
+        assert!(!mentions_bot("/cancel", "PaperCheckBot"));
+        assert!(!mentions_bot("/ask@OtherBot 问题", "PaperCheckBot"));
     }
 
     #[test]
