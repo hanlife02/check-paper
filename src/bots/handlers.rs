@@ -46,8 +46,7 @@ impl BotHandlers {
         let stripped = text.trim();
         if stripped.chars().count() > MAX_TELEGRAM_USER_TEXT_CHARS {
             return Ok(format!(
-                "消息过长，请控制在 {} 个字符以内。",
-                MAX_TELEGRAM_USER_TEXT_CHARS
+                "消息过长，请控制在 {MAX_TELEGRAM_USER_TEXT_CHARS} 个字符以内。"
             ));
         }
         if stripped.starts_with("/start") {
@@ -122,8 +121,7 @@ impl BotHandlers {
         let stripped = text.trim();
         if stripped.chars().count() > MAX_TELEGRAM_USER_TEXT_CHARS {
             return Ok(format!(
-                "消息过长，请控制在 {} 个字符以内。",
-                MAX_TELEGRAM_USER_TEXT_CHARS
+                "消息过长，请控制在 {MAX_TELEGRAM_USER_TEXT_CHARS} 个字符以内。"
             ));
         }
         if stripped.starts_with("/start") {

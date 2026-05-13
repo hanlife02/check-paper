@@ -2,7 +2,10 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use rusqlite::{OptionalExtension, params};
 
-use super::{AnalysisCandidate, AnalysisJobSummary, AnalysisJobTask, Storage, sqlite_timestamp};
+use super::{
+    AnalysisCandidate, AnalysisJobMetadata, AnalysisJobSummary, AnalysisJobTask, Storage,
+    sqlite_timestamp,
+};
 
 impl Storage {
     pub(super) fn count_analysis_jobs(&self, author: Option<&str>, status: &str) -> Result<i64> {
@@ -50,13 +53,7 @@ impl Storage {
     pub fn record_analysis_job_with_metadata(
         &self,
         row: &AnalysisCandidate,
-        job_type: &str,
-        status: &str,
-        error_code: Option<&str>,
-        error: Option<&str>,
-        profile_schema_version: i64,
-        prompt_version: &str,
-        model_id: &str,
+        metadata: AnalysisJobMetadata<'_>,
     ) -> Result<()> {
         self.conn.execute(
             r#"
@@ -68,24 +65,24 @@ impl Storage {
             "#,
             params![
                 row.paper_key,
-                job_type,
-                status,
-                error,
+                metadata.job_type,
+                metadata.status,
+                metadata.error,
                 row.source_hash,
-                profile_schema_version,
-                prompt_version,
-                model_id,
-                error_code
+                metadata.profile_schema_version,
+                metadata.prompt_version,
+                metadata.model_id,
+                metadata.error_code
             ],
         )?;
-        if status == "failed" {
+        if metadata.status == "failed" {
             self.conn.execute(
                 r#"
                 UPDATE papers
                 SET profile_status = 'failed', profile_error_code = ?
                 WHERE paper_key = ?
                 "#,
-                params![error_code, row.paper_key],
+                params![metadata.error_code, row.paper_key],
             )?;
         }
         Ok(())

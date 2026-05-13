@@ -23,7 +23,7 @@ use crate::services::jobs::JobService;
 use crate::services::profile::{AuthorProfileLookup, AuthorProfileRebuild, ProfileService};
 use crate::services::qa::QaService;
 use crate::services::status::StatusService;
-use crate::storage::Storage;
+use crate::storage::{PaperProfileMetadata, Storage};
 use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
 use crate::understanding::paper_analyzer::{analyze_paper, extract_section_facts};
 use crate::understanding::prompts::PAPER_PROFILE_PROMPT_VERSION;
@@ -549,24 +549,20 @@ fn print_config(keys: &[&str]) -> Result<()> {
 
 fn progress_bar(len: u64, prefix: &'static str) -> ProgressBar {
     let progress = ProgressBar::new(len);
-    progress.set_style(
-        ProgressStyle::with_template(
-            "{prefix:.bold} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
+    if let Ok(style) = ProgressStyle::with_template(
+        "{prefix:.bold} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
+    ) {
+        progress.set_style(style.progress_chars("=>-"));
+    }
     progress.set_prefix(prefix);
     progress
 }
 
 fn paper_progress(message: String) -> ProgressBar {
     let progress = ProgressBar::new_spinner();
-    progress.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] {msg}")
-            .unwrap()
-            .tick_chars("|/-\\"),
-    );
+    if let Ok(style) = ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] {msg}") {
+        progress.set_style(style.tick_chars("|/-\\"));
+    }
     progress.enable_steady_tick(Duration::from_millis(120));
     progress.set_message(message);
     progress
@@ -674,12 +670,14 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
             Ok(profile) => {
                 storage.save_paper_profile_with_metadata(
                     &paper.key(),
-                    &paper.source_hash,
                     &profile,
-                    PAPER_PROFILE_SCHEMA_VERSION,
-                    PAPER_PROFILE_PROMPT_VERSION,
-                    llm.model_name(),
-                    &settings.chunker_version,
+                    PaperProfileMetadata {
+                        source_hash: &paper.source_hash,
+                        schema_version: PAPER_PROFILE_SCHEMA_VERSION,
+                        prompt_version: PAPER_PROFILE_PROMPT_VERSION,
+                        model_id: llm.model_name(),
+                        chunker_version: &settings.chunker_version,
+                    },
                 )?;
                 storage.save_paper_facts(
                     &paper.key(),
@@ -718,10 +716,7 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
                 println!("author profile already up to date");
             }
             AuthorProfileRebuild::Rebuilt { profile_count } => {
-                println!(
-                    "updated author profile with {} paper profiles",
-                    profile_count
-                );
+                println!("updated author profile with {profile_count} paper profiles");
             }
         }
     }
@@ -994,13 +989,13 @@ fn cmd_status(args: AuthorArgs, settings: &Settings) -> Result<()> {
     println!("cancelled_jobs: {}", status.cancelled_jobs);
     println!("qa_logs: {}", status.qa_logs);
     if let Some(latency) = status.avg_qa_latency_ms {
-        println!("avg_qa_latency_ms: {:.0}", latency);
+        println!("avg_qa_latency_ms: {latency:.0}");
     }
     if let Some(tokens) = status.total_qa_tokens {
         println!("total_qa_tokens: {tokens}");
     }
     if let Some(cost) = status.total_qa_cost_usd {
-        println!("total_qa_cost_usd: {:.6}", cost);
+        println!("total_qa_cost_usd: {cost:.6}");
     }
     Ok(())
 }

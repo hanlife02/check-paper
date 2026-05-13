@@ -9,7 +9,7 @@ use crate::qa::verifier::{parse_qa_answer, verify_qa_answer};
 use crate::retrieval::embedding::OpenAiCompatibleEmbeddingClient;
 use crate::retrieval::profile_route::search_profiles_for_query;
 use crate::schemas::qa_answer::{QA_ANSWER_SCHEMA_VERSION, signals_insufficient};
-use crate::storage::{QaLogMetadata, Storage};
+use crate::storage::{QaLogEntry, QaLogMetadata, SourceChunk, Storage};
 use crate::understanding::llm::{LlmUsage, OpenAiCompatibleClient};
 use crate::understanding::prompts::{QA_PROMPT_VERSION, qa_messages, qa_repair_messages};
 
@@ -17,6 +17,17 @@ const PROFILE_CONTEXT_LIMIT: usize = 8;
 const DEFAULT_CHUNK_LIMIT: usize = 8;
 const RETRY_CHUNK_LIMIT: usize = 10;
 const QA_CHUNK_LIMIT_ENV: &str = "CHECK_PAPER_QA_CHUNK_LIMIT";
+
+struct AnswerLogContext<'a> {
+    author: &'a str,
+    question: &'a str,
+    profiles: &'a [serde_json::Value],
+    chunks: &'a [SourceChunk],
+    retrieval_trace: &'a serde_json::Value,
+    started: Instant,
+    max_tokens: i64,
+    usage: Option<&'a LlmUsage>,
+}
 
 pub struct Answerer<'a> {
     storage: &'a Storage,
@@ -66,30 +77,34 @@ impl<'a> Answerer<'a> {
                 Ok(answer) => answer,
                 Err(err) => {
                     self.log_failed_answer(
-                        author,
-                        question,
-                        &profiles,
-                        &chunks,
-                        &retrieval_trace,
+                        AnswerLogContext {
+                            author,
+                            question,
+                            profiles: &profiles,
+                            chunks: &chunks,
+                            retrieval_trace: &retrieval_trace,
+                            started,
+                            max_tokens: 2600,
+                            usage: Some(&second.usage),
+                        },
                         &second.content,
                         &err.to_string(),
-                        started,
-                        2600,
-                        Some(&second.usage),
                     )?;
                     return Err(err);
                 }
             };
             self.log_answer(
-                author,
-                question,
-                &profiles,
-                &chunks,
-                &retrieval_trace,
+                AnswerLogContext {
+                    author,
+                    question,
+                    profiles: &profiles,
+                    chunks: &chunks,
+                    retrieval_trace: &retrieval_trace,
+                    started,
+                    max_tokens: 2600,
+                    usage: Some(&second.usage),
+                },
                 &repaired,
-                started,
-                2600,
-                Some(&second.usage),
             )?;
             return Ok(render_qa_answer(&repaired));
         }
@@ -97,30 +112,34 @@ impl<'a> Answerer<'a> {
             Ok(answer) => answer,
             Err(err) => {
                 self.log_failed_answer(
-                    author,
-                    question,
-                    &profiles,
-                    &chunks,
-                    &retrieval_trace,
+                    AnswerLogContext {
+                        author,
+                        question,
+                        profiles: &profiles,
+                        chunks: &chunks,
+                        retrieval_trace: &retrieval_trace,
+                        started,
+                        max_tokens: 2200,
+                        usage: Some(&first.usage),
+                    },
                     &first.content,
                     &err.to_string(),
-                    started,
-                    2200,
-                    Some(&first.usage),
                 )?;
                 return Err(err);
             }
         };
         self.log_answer(
-            author,
-            question,
-            &profiles,
-            &chunks,
-            &retrieval_trace,
+            AnswerLogContext {
+                author,
+                question,
+                profiles: &profiles,
+                chunks: &chunks,
+                retrieval_trace: &retrieval_trace,
+                started,
+                max_tokens: 2200,
+                usage: Some(&first.usage),
+            },
             &repaired,
-            started,
-            2200,
-            Some(&first.usage),
         )?;
         Ok(render_qa_answer(&repaired))
     }
@@ -166,30 +185,34 @@ impl<'a> Answerer<'a> {
                 Ok(answer) => answer,
                 Err(err) => {
                     self.log_failed_answer(
-                        author,
-                        question,
-                        &profiles,
-                        &chunks,
-                        &retrieval_trace,
+                        AnswerLogContext {
+                            author,
+                            question,
+                            profiles: &profiles,
+                            chunks: &chunks,
+                            retrieval_trace: &retrieval_trace,
+                            started,
+                            max_tokens: 2600,
+                            usage: None,
+                        },
                         &second,
                         &err.to_string(),
-                        started,
-                        2600,
-                        None,
                     )?;
                     return Err(err);
                 }
             };
             self.log_answer(
-                author,
-                question,
-                &profiles,
-                &chunks,
-                &retrieval_trace,
+                AnswerLogContext {
+                    author,
+                    question,
+                    profiles: &profiles,
+                    chunks: &chunks,
+                    retrieval_trace: &retrieval_trace,
+                    started,
+                    max_tokens: 2600,
+                    usage: None,
+                },
                 &repaired,
-                started,
-                2600,
-                None,
             )?;
             return Ok(render_qa_answer(&repaired));
         }
@@ -197,30 +220,34 @@ impl<'a> Answerer<'a> {
             Ok(answer) => answer,
             Err(err) => {
                 self.log_failed_answer(
-                    author,
-                    question,
-                    &profiles,
-                    &chunks,
-                    &retrieval_trace,
+                    AnswerLogContext {
+                        author,
+                        question,
+                        profiles: &profiles,
+                        chunks: &chunks,
+                        retrieval_trace: &retrieval_trace,
+                        started,
+                        max_tokens: 2200,
+                        usage: None,
+                    },
                     &first,
                     &err.to_string(),
-                    started,
-                    2200,
-                    None,
                 )?;
                 return Err(err);
             }
         };
         self.log_answer(
-            author,
-            question,
-            &profiles,
-            &chunks,
-            &retrieval_trace,
+            AnswerLogContext {
+                author,
+                question,
+                profiles: &profiles,
+                chunks: &chunks,
+                retrieval_trace: &retrieval_trace,
+                started,
+                max_tokens: 2200,
+                usage: None,
+            },
             &repaired,
-            started,
-            2200,
-            None,
         )?;
         Ok(render_qa_answer(&repaired))
     }
@@ -294,21 +321,10 @@ impl<'a> Answerer<'a> {
         )
     }
 
-    fn log_answer(
-        &self,
-        author: &str,
-        question: &str,
-        profiles: &[serde_json::Value],
-        chunks: &[crate::storage::SourceChunk],
-        retrieval_trace: &serde_json::Value,
-        raw_answer: &str,
-        started: Instant,
-        max_tokens: i64,
-        usage: Option<&LlmUsage>,
-    ) -> Result<()> {
+    fn log_answer(&self, context: AnswerLogContext<'_>, raw_answer: &str) -> Result<()> {
         let retrieval = json!({
-            "profile_count": profiles.len(),
-            "chunks": chunks.iter().map(|chunk| json!({
+            "profile_count": context.profiles.len(),
+            "chunks": context.chunks.iter().map(|chunk| json!({
                 "paper_key": chunk.paper_key,
                 "title": chunk.title,
                 "doi": chunk.doi,
@@ -322,14 +338,14 @@ impl<'a> Answerer<'a> {
                 "chunk_hash": stored_chunk_hash(chunk),
                 "chunker_version": chunk.chunker_version,
             })).collect::<Vec<_>>(),
-            "trace": retrieval_trace,
+            "trace": context.retrieval_trace,
         });
         let mut answer_json = parse_qa_answer(raw_answer)
             .map(|answer| {
                 serde_json::to_value(answer).unwrap_or_else(|_| json!({ "raw": raw_answer }))
             })
             .unwrap_or_else(|| json!({ "raw": raw_answer }));
-        let snapshot = evidence_snapshot(&answer_json, chunks);
+        let snapshot = evidence_snapshot(&answer_json, context.chunks);
         if let Some(object) = answer_json.as_object_mut() {
             object.insert(
                 "answer_schema_version".to_string(),
@@ -337,43 +353,38 @@ impl<'a> Answerer<'a> {
             );
             object.insert("evidence_snapshot".to_string(), snapshot);
         }
-        self.storage.save_qa_log_with_metadata(
-            author,
-            question,
-            &retrieval,
-            &answer_json,
-            self.llm.model_name(),
-            started.elapsed().as_millis() as i64,
-            Some(QaLogMetadata {
+        self.storage.save_qa_log_with_metadata(QaLogEntry {
+            author: context.author,
+            question: context.question,
+            retrieval: &retrieval,
+            answer: &answer_json,
+            model: self.llm.model_name(),
+            latency_ms: context.started.elapsed().as_millis() as i64,
+            metadata: Some(QaLogMetadata {
                 answer_schema_version: Some(QA_ANSWER_SCHEMA_VERSION),
                 qa_prompt_version: Some(QA_PROMPT_VERSION),
                 temperature: Some(0.2),
-                max_tokens: Some(max_tokens),
-                prompt_tokens: usage.and_then(|usage| usage.prompt_tokens),
-                completion_tokens: usage.and_then(|usage| usage.completion_tokens),
-                total_tokens: usage.and_then(|usage| usage.total_tokens),
-                cost_usd: usage.and_then(|usage| self.llm.estimate_cost_usd(usage)),
+                max_tokens: Some(context.max_tokens),
+                prompt_tokens: context.usage.and_then(|usage| usage.prompt_tokens),
+                completion_tokens: context.usage.and_then(|usage| usage.completion_tokens),
+                total_tokens: context.usage.and_then(|usage| usage.total_tokens),
+                cost_usd: context
+                    .usage
+                    .and_then(|usage| self.llm.estimate_cost_usd(usage)),
                 error_code: None,
             }),
-        )
+        })
     }
 
     fn log_failed_answer(
         &self,
-        author: &str,
-        question: &str,
-        profiles: &[serde_json::Value],
-        chunks: &[crate::storage::SourceChunk],
-        retrieval_trace: &serde_json::Value,
+        context: AnswerLogContext<'_>,
         raw_answer: &str,
         error: &str,
-        started: Instant,
-        max_tokens: i64,
-        usage: Option<&LlmUsage>,
     ) -> Result<()> {
         let retrieval = json!({
-            "profile_count": profiles.len(),
-            "chunks": chunks.iter().map(|chunk| json!({
+            "profile_count": context.profiles.len(),
+            "chunks": context.chunks.iter().map(|chunk| json!({
                 "paper_key": chunk.paper_key,
                 "title": chunk.title,
                 "doi": chunk.doi,
@@ -387,7 +398,7 @@ impl<'a> Answerer<'a> {
                 "chunk_hash": stored_chunk_hash(chunk),
                 "chunker_version": chunk.chunker_version,
             })).collect::<Vec<_>>(),
-            "trace": retrieval_trace,
+            "trace": context.retrieval_trace,
         });
         let answer_json = json!({
             "raw": raw_answer,
@@ -395,25 +406,27 @@ impl<'a> Answerer<'a> {
             "answer_schema_version": QA_ANSWER_SCHEMA_VERSION,
             "evidence_snapshot": [],
         });
-        self.storage.save_qa_log_with_metadata(
-            author,
-            question,
-            &retrieval,
-            &answer_json,
-            self.llm.model_name(),
-            started.elapsed().as_millis() as i64,
-            Some(QaLogMetadata {
+        self.storage.save_qa_log_with_metadata(QaLogEntry {
+            author: context.author,
+            question: context.question,
+            retrieval: &retrieval,
+            answer: &answer_json,
+            model: self.llm.model_name(),
+            latency_ms: context.started.elapsed().as_millis() as i64,
+            metadata: Some(QaLogMetadata {
                 answer_schema_version: Some(QA_ANSWER_SCHEMA_VERSION),
                 qa_prompt_version: Some(QA_PROMPT_VERSION),
                 temperature: Some(0.2),
-                max_tokens: Some(max_tokens),
-                prompt_tokens: usage.and_then(|usage| usage.prompt_tokens),
-                completion_tokens: usage.and_then(|usage| usage.completion_tokens),
-                total_tokens: usage.and_then(|usage| usage.total_tokens),
-                cost_usd: usage.and_then(|usage| self.llm.estimate_cost_usd(usage)),
+                max_tokens: Some(context.max_tokens),
+                prompt_tokens: context.usage.and_then(|usage| usage.prompt_tokens),
+                completion_tokens: context.usage.and_then(|usage| usage.completion_tokens),
+                total_tokens: context.usage.and_then(|usage| usage.total_tokens),
+                cost_usd: context
+                    .usage
+                    .and_then(|usage| self.llm.estimate_cost_usd(usage)),
                 error_code: Some("evidence_invalid"),
             }),
-        )
+        })
     }
 
     fn valid_or_repaired_answer(

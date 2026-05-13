@@ -2,19 +2,23 @@ use anyhow::{Result, anyhow};
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
-use super::{QaLogMetadata, QaLogSummary, Storage};
+use super::{QaLogEntry, QaLogStats, QaLogSummary, Storage};
 
 impl Storage {
-    pub(super) fn qa_log_stats(
-        &self,
-        author: Option<&str>,
-    ) -> Result<(i64, Option<f64>, Option<i64>, Option<f64>)> {
+    pub(super) fn qa_log_stats(&self, author: Option<&str>) -> Result<QaLogStats> {
         if let Some(author) = author {
             self.conn
                 .query_row(
                     "SELECT COUNT(*), AVG(latency_ms), SUM(total_tokens), SUM(cost_usd) FROM qa_logs WHERE author = ?",
                     params![author],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok(QaLogStats {
+                            count: row.get(0)?,
+                            avg_latency_ms: row.get(1)?,
+                            total_tokens: row.get(2)?,
+                            total_cost_usd: row.get(3)?,
+                        })
+                    },
                 )
                 .map_err(Into::into)
         } else {
@@ -22,7 +26,14 @@ impl Storage {
                 .query_row(
                     "SELECT COUNT(*), AVG(latency_ms), SUM(total_tokens), SUM(cost_usd) FROM qa_logs",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok(QaLogStats {
+                            count: row.get(0)?,
+                            avg_latency_ms: row.get(1)?,
+                            total_tokens: row.get(2)?,
+                            total_cost_usd: row.get(3)?,
+                        })
+                    },
                 )
                 .map_err(Into::into)
         }
@@ -37,24 +48,24 @@ impl Storage {
         model: &str,
         latency_ms: i64,
     ) -> Result<()> {
-        self.save_qa_log_with_metadata(author, question, retrieval, answer, model, latency_ms, None)
+        self.save_qa_log_with_metadata(QaLogEntry {
+            author,
+            question,
+            retrieval,
+            answer,
+            model,
+            latency_ms,
+            metadata: None,
+        })
     }
 
-    pub fn save_qa_log_with_metadata(
-        &self,
-        author: &str,
-        question: &str,
-        retrieval: &Value,
-        answer: &Value,
-        model: &str,
-        latency_ms: i64,
-        metadata: Option<QaLogMetadata<'_>>,
-    ) -> Result<()> {
-        let retrieval_trace_json = retrieval
+    pub fn save_qa_log_with_metadata(&self, entry: QaLogEntry<'_>) -> Result<()> {
+        let retrieval_trace_json = entry
+            .retrieval
             .get("trace")
             .map(serde_json::to_string)
             .transpose()?;
-        let metadata = metadata.unwrap_or_default();
+        let metadata = entry.metadata.unwrap_or_default();
         self.conn.execute(
             r#"
             INSERT INTO qa_logs (
@@ -66,12 +77,12 @@ impl Storage {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
-                author,
-                question,
-                serde_json::to_string(retrieval)?,
-                serde_json::to_string(answer)?,
-                model,
-                latency_ms,
+                entry.author,
+                entry.question,
+                serde_json::to_string(entry.retrieval)?,
+                serde_json::to_string(entry.answer)?,
+                entry.model,
+                entry.latency_ms,
                 retrieval_trace_json,
                 metadata.answer_schema_version,
                 metadata.qa_prompt_version,

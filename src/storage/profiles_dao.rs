@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-use super::Storage;
+use super::{PaperProfileMetadata, Storage};
 
 impl Storage {
     pub fn save_paper_profile(
@@ -11,18 +11,24 @@ impl Storage {
         source_hash: &str,
         profile: &Value,
     ) -> Result<()> {
-        self.save_paper_profile_with_metadata(paper_key, source_hash, profile, 1, "", "", "")
+        self.save_paper_profile_with_metadata(
+            paper_key,
+            profile,
+            PaperProfileMetadata {
+                source_hash,
+                schema_version: 1,
+                prompt_version: "",
+                model_id: "",
+                chunker_version: "",
+            },
+        )
     }
 
     pub fn save_paper_profile_with_metadata(
         &self,
         paper_key: &str,
-        source_hash: &str,
         profile: &Value,
-        profile_schema_version: i64,
-        profile_prompt_version: &str,
-        profile_model_id: &str,
-        profile_chunker_version: &str,
+        metadata: PaperProfileMetadata<'_>,
     ) -> Result<()> {
         self.conn.execute(
             r#"
@@ -39,15 +45,15 @@ impl Storage {
             "#,
             params![
                 serde_json::to_string(profile)?,
-                source_hash,
-                profile_schema_version,
-                profile_prompt_version,
-                profile_model_id,
-                profile_chunker_version,
+                metadata.source_hash,
+                metadata.schema_version,
+                metadata.prompt_version,
+                metadata.model_id,
+                metadata.chunker_version,
                 paper_key
             ],
         )?;
-        self.save_profile_facts(paper_key, profile, profile_schema_version)?;
+        self.save_profile_facts(paper_key, profile, metadata.schema_version)?;
         Ok(())
     }
 

@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
+use serde_json::Value;
 
 mod chunks_dao;
 mod embeddings_dao;
@@ -110,6 +111,45 @@ pub struct QaLogMetadata<'a> {
     pub error_code: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PaperProfileMetadata<'a> {
+    pub source_hash: &'a str,
+    pub schema_version: i64,
+    pub prompt_version: &'a str,
+    pub model_id: &'a str,
+    pub chunker_version: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AnalysisJobMetadata<'a> {
+    pub job_type: &'a str,
+    pub status: &'a str,
+    pub error_code: Option<&'a str>,
+    pub error: Option<&'a str>,
+    pub profile_schema_version: i64,
+    pub prompt_version: &'a str,
+    pub model_id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QaLogEntry<'a> {
+    pub author: &'a str,
+    pub question: &'a str,
+    pub retrieval: &'a Value,
+    pub answer: &'a Value,
+    pub model: &'a str,
+    pub latency_ms: i64,
+    pub metadata: Option<QaLogMetadata<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct QaLogStats {
+    pub count: i64,
+    pub avg_latency_ms: Option<f64>,
+    pub total_tokens: Option<i64>,
+    pub total_cost_usd: Option<f64>,
+}
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -157,7 +197,7 @@ mod tests {
     use crate::retrieval::query::query_terms;
     use rusqlite::Connection;
 
-    use super::{QaLogMetadata, SourceChunk, Storage};
+    use super::{QaLogEntry, QaLogMetadata, SourceChunk, Storage};
 
     #[test]
     fn query_terms_rewrite_keeps_doi_numbers_and_phrases() {
@@ -207,14 +247,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
         storage
-            .save_qa_log_with_metadata(
-                "Alice",
-                "question",
-                &json!({ "chunks": [] }),
-                &json!({ "answer": "ok" }),
-                "test-model",
-                12,
-                Some(QaLogMetadata {
+            .save_qa_log_with_metadata(QaLogEntry {
+                author: "Alice",
+                question: "question",
+                retrieval: &json!({ "chunks": [] }),
+                answer: &json!({ "answer": "ok" }),
+                model: "test-model",
+                latency_ms: 12,
+                metadata: Some(QaLogMetadata {
                     answer_schema_version: Some(1),
                     qa_prompt_version: Some("qa-v1"),
                     temperature: Some(0.2),
@@ -225,7 +265,7 @@ mod tests {
                     cost_usd: Some(0.001),
                     error_code: None,
                 }),
-            )
+            })
             .unwrap();
 
         let (prompt_tokens, completion_tokens, total_tokens): (i64, i64, i64) = storage
@@ -260,18 +300,18 @@ mod tests {
             ("Bob", "verifier_failed"),
         ] {
             storage
-                .save_qa_log_with_metadata(
+                .save_qa_log_with_metadata(QaLogEntry {
                     author,
-                    "question",
-                    &json!({ "chunks": [] }),
-                    &json!({ "answer": "failed" }),
-                    "test-model",
-                    12,
-                    Some(QaLogMetadata {
+                    question: "question",
+                    retrieval: &json!({ "chunks": [] }),
+                    answer: &json!({ "answer": "failed" }),
+                    model: "test-model",
+                    latency_ms: 12,
+                    metadata: Some(QaLogMetadata {
                         error_code: Some(error_code),
                         ..Default::default()
                     }),
-                )
+                })
                 .unwrap();
         }
 

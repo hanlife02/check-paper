@@ -207,7 +207,7 @@ fn parse_caption_tail(value: &str) -> Option<(String, String)> {
     }
     let text = value[label_end..]
         .trim_start()
-        .trim_start_matches(|ch: char| matches!(ch, '.' | ':' | '-' | '|' | ')'))
+        .trim_start_matches(['.', ':', '-', '|', ')'])
         .trim_start()
         .to_string();
     Some((label, text))
@@ -216,7 +216,7 @@ fn parse_caption_tail(value: &str) -> Option<(String, String)> {
 fn normalize_caption_line(value: &str) -> String {
     strip_inline_noise(value)
         .replace('\u{00a0}', " ")
-        .trim_start_matches(|ch: char| matches!(ch, '-' | '*' | ' '))
+        .trim_start_matches(['-', '*', ' '])
         .replace("**", "")
         .replace("__", "")
         .trim()
@@ -276,9 +276,10 @@ fn parse_line_based_metadata(lines: &[String]) -> BTreeMap<String, String> {
 fn parse_scalar(value: &str) -> String {
     let value = value.trim();
     if value.len() >= 2 {
-        let first = value.chars().next().unwrap();
-        let last = value.chars().last().unwrap();
-        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+        let first = value.chars().next();
+        let last = value.chars().last();
+        if (first == Some('"') && last == Some('"')) || (first == Some('\'') && last == Some('\''))
+        {
             return value[1..value.len() - 1].to_string();
         }
     }

@@ -106,7 +106,7 @@ impl TelegramBot {
                     eprintln!("Telegram update {} ignored: {reason}", update.update_id);
                     continue;
                 }
-                let text = strip_bot_mention(&text, bot_username.as_deref());
+                let text = strip_bot_mention(text, bot_username.as_deref());
                 if is_dispatcher_cancel_command(text.trim()) {
                     match dispatcher.cancel(message.chat.id) {
                         DispatchAction::Cancelled { active_job_id, .. } => {

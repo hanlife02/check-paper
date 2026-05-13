@@ -245,7 +245,6 @@ fn matches_count_prefix_line(line: &str, prefix: &str) -> bool {
 fn normalize_noise_line(line: &str) -> String {
     line.trim()
         .trim_matches(|ch: char| matches!(ch, '#' | '*' | '_' | ':' | '|' | '-'))
-        .trim()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

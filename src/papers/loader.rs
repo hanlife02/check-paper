@@ -117,6 +117,23 @@ fn source_hash_with_versions(
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn author_from_root(paper_root: &Path, paper_dir: &Path) -> String {
+    paper_dir
+        .strip_prefix(paper_root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| component.as_os_str().to_str())
+        .map(str::to_string)
+        .or_else(|| {
+            paper_dir
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -146,21 +163,4 @@ mod tests {
         assert_ne!(base, parser_changed);
         assert_ne!(base, cleaner_changed);
     }
-}
-
-fn author_from_root(paper_root: &Path, paper_dir: &Path) -> String {
-    paper_dir
-        .strip_prefix(paper_root)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .and_then(|component| component.as_os_str().to_str())
-        .map(str::to_string)
-        .or_else(|| {
-            paper_dir
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
 }

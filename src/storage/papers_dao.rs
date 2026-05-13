@@ -265,8 +265,7 @@ impl Storage {
         let running_jobs = self.count_analysis_jobs(author, "running")?;
         let retry_waiting_jobs = self.count_analysis_jobs(author, "retry_waiting")?;
         let cancelled_jobs = self.count_analysis_jobs(author, "cancelled")?;
-        let (qa_logs, avg_qa_latency_ms, total_qa_tokens, total_qa_cost_usd) =
-            self.qa_log_stats(author)?;
+        let qa_log_stats = self.qa_log_stats(author)?;
         Ok(LibraryStatus {
             papers,
             analyzed,
@@ -276,10 +275,10 @@ impl Storage {
             running_jobs,
             retry_waiting_jobs,
             cancelled_jobs,
-            qa_logs,
-            avg_qa_latency_ms,
-            total_qa_tokens,
-            total_qa_cost_usd,
+            qa_logs: qa_log_stats.count,
+            avg_qa_latency_ms: qa_log_stats.avg_latency_ms,
+            total_qa_tokens: qa_log_stats.total_tokens,
+            total_qa_cost_usd: qa_log_stats.total_cost_usd,
         })
     }
 
