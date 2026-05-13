@@ -381,17 +381,13 @@ impl BotHandlers {
         }
         let has_more = summaries.len() > AUTHOR_CHOICE_LIMIT;
         summaries.truncate(AUTHOR_CHOICE_LIMIT);
-        if summaries.len() == 1 {
+        if summaries.len() == 1 && matches!(action, PendingAuthorAction::Ask { .. }) {
             let author = summaries[0].author.clone();
             self.set_chat_author(chat_id, &author)?;
-            return Ok(match action {
-                PendingAuthorAction::SetDefault => {
-                    AuthorSelectionOutcome::Message(format!("当前 chat 默认作者已设置为：{author}"))
-                }
-                PendingAuthorAction::Ask { question } => {
-                    AuthorSelectionOutcome::Ask { author, question }
-                }
-            });
+            let PendingAuthorAction::Ask { question } = action else {
+                unreachable!("checked action above")
+            };
+            return Ok(AuthorSelectionOutcome::Ask { author, question });
         }
 
         let authors = summaries
@@ -870,6 +866,25 @@ mod tests {
         assert!(prompt.contains("2. Bob (1 papers)"));
         assert_eq!(selected, "当前 chat 默认作者已设置为：Bob");
         assert_eq!(current, "当前默认作者：Bob");
+    }
+
+    #[test]
+    fn use_author_without_argument_lists_single_author_before_selecting() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite");
+        let mut storage = crate::storage::Storage::open(&db_path).unwrap();
+        storage
+            .upsert_paper(&test_paper(dir.path(), "Ruqiang ZOU", "paper-a"), &[])
+            .unwrap();
+        drop(storage);
+        let handlers = BotHandlers::new(db_path, test_llm(), None, None);
+
+        let prompt = handlers.handle_text(7, "/use_author").unwrap();
+        let selected = handlers.handle_text(7, "1").unwrap();
+
+        assert!(prompt.contains("请选择当前 chat 的默认作者："));
+        assert!(prompt.contains("1. Ruqiang ZOU (1 papers)"));
+        assert_eq!(selected, "当前 chat 默认作者已设置为：Ruqiang ZOU");
     }
 
     #[test]
