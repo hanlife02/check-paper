@@ -140,6 +140,12 @@ struct TelegramApiUser {
     username: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaperRootAuthorSummary {
+    author: String,
+    paper_count: usize,
+}
+
 #[derive(Args)]
 struct AuthorArgs {
     #[arg(long, help = "Author directory under the paper root")]
@@ -714,31 +720,100 @@ fn display_name(path: &std::path::Path) -> String {
 }
 
 fn cmd_authors(settings: &Settings) -> Result<()> {
-    let storage = Storage::open(&settings.db_path)?;
-    let authors = storage.authors()?;
+    let authors = database_authors(settings)?;
+    let paper_root_authors = paper_root_authors(&settings.paper_root)?;
     println!(
         "{}",
-        format_authors(&authors, settings.default_author.as_deref())
+        format_author_inventory(
+            &authors,
+            &paper_root_authors,
+            settings.default_author.as_deref()
+        )
     );
     Ok(())
 }
 
-fn format_authors(authors: &[AuthorSummary], default_author: Option<&str>) -> String {
-    if authors.is_empty() {
-        return "no authors in database; run `ppc ingest --author AUTHOR` or `ppc sync --author AUTHOR` first".to_string();
+fn database_authors(settings: &Settings) -> Result<Vec<AuthorSummary>> {
+    if !settings.db_path.exists() {
+        return Ok(Vec::new());
     }
+    Storage::open(&settings.db_path)?.authors()
+}
+
+fn paper_root_authors(paper_root: &std::path::Path) -> Result<Vec<PaperRootAuthorSummary>> {
+    let paper_dirs = scan_paper_dirs(paper_root, None)?;
+    let mut counts = BTreeMap::<String, usize>::new();
+    for paper_dir in paper_dirs {
+        let Some(author) = paper_dir
+            .parent()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        *counts.entry(author).or_default() += 1;
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(author, paper_count)| PaperRootAuthorSummary {
+            author,
+            paper_count,
+        })
+        .collect())
+}
+
+fn format_author_inventory(
+    authors: &[AuthorSummary],
+    paper_root_authors: &[PaperRootAuthorSummary],
+    default_author: Option<&str>,
+) -> String {
+    if authors.is_empty() {
+        if paper_root_authors.is_empty() {
+            return "no authors found; run `ppc scan`, then `ppc ingest --author AUTHOR` or `ppc sync --author AUTHOR` first".to_string();
+        }
+        let mut lines = vec![format!("authors: {}", paper_root_authors.len())];
+        for (index, author) in paper_root_authors.iter().enumerate() {
+            let default_marker = if Some(author.author.as_str()) == default_author {
+                "; default"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{}. {} (paper/: {} papers; not ingested{})",
+                index + 1,
+                author.author,
+                author.paper_count,
+                default_marker
+            ));
+        }
+        lines.push(
+            "Import one with `ppc ingest --author \"NAME\"` or `ppc sync --author \"NAME\"`."
+                .to_string(),
+        );
+        return lines.join("\n");
+    }
+
+    let paper_counts = paper_root_authors
+        .iter()
+        .map(|author| (author.author.as_str(), author.paper_count))
+        .collect::<BTreeMap<_, _>>();
     let mut lines = vec![format!("authors: {}", authors.len())];
     for (index, author) in authors.iter().enumerate() {
         let default_marker = if Some(author.author.as_str()) == default_author {
-            " default"
+            "; default"
         } else {
             ""
         };
+        let paper_root_text = paper_counts
+            .get(author.author.as_str())
+            .map(|count| format!("; paper/: {count} papers"))
+            .unwrap_or_else(|| "; paper/: not found".to_string());
         lines.push(format!(
-            "{}. {} ({} papers{})",
+            "{}. {} (db: {} papers{}{})",
             index + 1,
             author.author,
             author.paper_count,
+            paper_root_text,
             default_marker
         ));
     }
@@ -1238,11 +1313,13 @@ fn missing_author_message(settings: &Settings) -> String {
 }
 
 fn available_author_hint(settings: &Settings) -> String {
-    if !settings.db_path.exists() {
-        return "No author database found yet. Run `ppc scan`, then `ppc ingest --author AUTHOR` or `ppc sync --author AUTHOR`.".to_string();
-    }
-    match Storage::open(&settings.db_path).and_then(|storage| storage.authors()) {
-        Ok(authors) => format_authors(&authors, settings.default_author.as_deref()),
+    let paper_root_authors = paper_root_authors(&settings.paper_root).unwrap_or_default();
+    match database_authors(settings) {
+        Ok(authors) => format_author_inventory(
+            &authors,
+            &paper_root_authors,
+            settings.default_author.as_deref(),
+        ),
         Err(err) => format!(
             "Could not read authors from {}: {err}",
             settings.db_path.display()
@@ -1319,11 +1396,13 @@ fn make_optional_embedding(settings: &Settings) -> Result<Option<OpenAiCompatibl
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::PathBuf;
 
     use super::{
-        AskArgs, TelegramBotStatus, cmd_ask, format_authors, format_cli_chat_ids, format_tg_status,
-        missing_author_message, redact_secret, resolve_author,
+        AskArgs, PaperRootAuthorSummary, TelegramBotStatus, cmd_ask, format_author_inventory,
+        format_cli_chat_ids, format_tg_status, missing_author_message, paper_root_authors,
+        redact_secret, resolve_author,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
@@ -1368,7 +1447,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing author"));
-        assert!(err.contains("ppc ingest --author AUTHOR"));
+        assert!(err.contains("ppc ingest"));
         assert_eq!(
             resolve_author(Some("Alice"), &without_default).unwrap(),
             "Alice"
@@ -1389,12 +1468,13 @@ mod tests {
         drop(storage);
         let mut settings = settings(None);
         settings.db_path = db_path;
+        settings.paper_root = dir.path().join("paper");
 
         let message = missing_author_message(&settings);
 
         assert!(message.contains("missing author"));
         assert!(message.contains("authors: 1"));
-        assert!(message.contains("1. Alice (1 papers)"));
+        assert!(message.contains("1. Alice (db: 1 papers; paper/: not found)"));
         assert!(message.contains("--author \"NAME\""));
     }
 
@@ -1415,7 +1495,7 @@ mod tests {
 
     #[test]
     fn formats_authors_with_default_marker() {
-        let text = format_authors(
+        let text = format_author_inventory(
             &[
                 AuthorSummary {
                     author: "Alice".to_string(),
@@ -1426,21 +1506,61 @@ mod tests {
                     paper_count: 2,
                 },
             ],
+            &[],
             Some("Bob"),
         );
 
         assert!(text.contains("authors: 2"));
-        assert!(text.contains("1. Alice (5 papers)"));
-        assert!(text.contains("2. Bob (2 papers default)"));
+        assert!(text.contains("1. Alice (db: 5 papers; paper/: not found)"));
+        assert!(text.contains("2. Bob (db: 2 papers; paper/: not found; default)"));
         assert!(text.contains("--author \"NAME\""));
     }
 
     #[test]
     fn formats_empty_authors_with_next_step() {
-        let text = format_authors(&[], None);
+        let text = format_author_inventory(&[], &[], None);
 
-        assert!(text.contains("no authors in database"));
+        assert!(text.contains("no authors found"));
         assert!(text.contains("ppc ingest --author AUTHOR"));
+    }
+
+    #[test]
+    fn formats_paper_root_authors_before_ingest() {
+        let text = format_author_inventory(
+            &[],
+            &[PaperRootAuthorSummary {
+                author: "Alice".to_string(),
+                paper_count: 2,
+            }],
+            None,
+        );
+
+        assert!(text.contains("authors: 1"));
+        assert!(text.contains("1. Alice (paper/: 2 papers; not ingested)"));
+        assert!(text.contains("ppc ingest --author \"NAME\""));
+    }
+
+    #[test]
+    fn counts_paper_root_authors_from_article_dirs() {
+        let dir = tempdir().unwrap();
+        let paper_a = dir.path().join("paper").join("Alice").join("paper-a");
+        let paper_b = dir.path().join("paper").join("Alice").join("paper-b");
+        let ignored = dir.path().join("paper").join("Bob").join("paper-x");
+        fs::create_dir_all(&paper_a).unwrap();
+        fs::create_dir_all(&paper_b).unwrap();
+        fs::create_dir_all(&ignored).unwrap();
+        fs::write(paper_a.join("article.md"), "# A").unwrap();
+        fs::write(paper_b.join("article.md"), "# B").unwrap();
+
+        let authors = paper_root_authors(&dir.path().join("paper")).unwrap();
+
+        assert_eq!(
+            authors,
+            vec![PaperRootAuthorSummary {
+                author: "Alice".to_string(),
+                paper_count: 2,
+            }]
+        );
     }
 
     #[test]
