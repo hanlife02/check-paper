@@ -59,7 +59,7 @@ impl TelegramBot {
     }
 
     async fn run_polling_async(&self) -> Result<()> {
-        let bot_username = self.get_me().await?.username;
+        let bot_username = self.get_bot_username_with_retry().await?;
         eprintln!(
             "Telegram bot started as {}; allowed chats: {}",
             format_bot_username(bot_username.as_deref()),
@@ -76,12 +76,20 @@ impl TelegramBot {
             }
             let updates = match self.get_updates(offset).await {
                 Ok(updates) => updates,
-                Err(err) if is_recoverable_poll_error(&err) => {
-                    eprintln!("Telegram polling temporarily failed: {err}");
+                Err(err) if is_recoverable_telegram_api_error(&err) => {
+                    eprintln!(
+                        "Telegram polling temporarily failed: {}",
+                        telegram_error_message(&err, &self.token)
+                    );
                     sleep(Duration::from_secs(TELEGRAM_POLL_RETRY_DELAY_SECS)).await;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    return Err(anyhow!(
+                        "Telegram polling failed: {}",
+                        telegram_error_message(&err, &self.token)
+                    ));
+                }
             };
             for update in updates {
                 offset = offset.max(update.update_id + 1);
@@ -128,6 +136,27 @@ impl TelegramBot {
                 self.apply_dispatch_action(action, done_tx.clone()).await?;
             }
             sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
+    async fn get_bot_username_with_retry(&self) -> Result<Option<String>> {
+        loop {
+            match self.get_me().await {
+                Ok(user) => return Ok(user.username),
+                Err(err) if is_recoverable_telegram_api_error(&err) => {
+                    eprintln!(
+                        "Telegram getMe temporarily failed: {}",
+                        telegram_error_message(&err, &self.token)
+                    );
+                    sleep(Duration::from_secs(TELEGRAM_POLL_RETRY_DELAY_SECS)).await;
+                }
+                Err(err) => {
+                    return Err(anyhow!(
+                        "Telegram getMe failed: {}",
+                        telegram_error_message(&err, &self.token)
+                    ));
+                }
+            }
         }
     }
 
@@ -518,18 +547,29 @@ fn trim_start_chars(text: &str, count: usize) -> &str {
     &text[byte_index..]
 }
 
-fn is_recoverable_poll_error(error: &anyhow::Error) -> bool {
+fn is_recoverable_telegram_api_error(error: &anyhow::Error) -> bool {
     let Some(error) = error.downcast_ref::<reqwest::Error>() else {
         return false;
     };
 
-    if error.is_timeout() || error.is_connect() {
-        return true;
+    match error.status() {
+        Some(status) => {
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        None => error.is_timeout() || error.is_connect() || error.is_request() || error.is_body(),
     }
+}
 
-    error.status().is_some_and(|status| {
-        status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-    })
+fn telegram_error_message(error: &anyhow::Error, token: &str) -> String {
+    redact_telegram_token(&format!("{error:#}"), token)
+}
+
+fn redact_telegram_token(text: &str, token: &str) -> String {
+    if token.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(token, "<redacted-telegram-token>")
+    }
 }
 
 fn telegram_retry_after(headers: &HeaderMap) -> Duration {
@@ -663,8 +703,8 @@ fn is_command_boundary(c: char) -> bool {
 mod tests {
     use super::{
         TELEGRAM_MAX_MESSAGE_CHARS, handler_text_after_bot_mention, is_dispatcher_cancel_command,
-        mentions_bot, should_stream_text, strip_bot_mention, telegram_message_pages,
-        telegram_retry_after,
+        mentions_bot, redact_telegram_token, should_stream_text, strip_bot_mention,
+        telegram_message_pages, telegram_retry_after,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -777,6 +817,19 @@ mod tests {
         headers.insert("retry-after", HeaderValue::from_static("7"));
         assert_eq!(telegram_retry_after(&headers).as_secs(), 7);
         assert_eq!(telegram_retry_after(&HeaderMap::new()).as_secs(), 3);
+    }
+
+    #[test]
+    fn redacts_telegram_token_from_error_messages() {
+        let text = redact_telegram_token(
+            "https://api.telegram.org/bot123:secret/getUpdates failed",
+            "123:secret",
+        );
+
+        assert_eq!(
+            text,
+            "https://api.telegram.org/bot<redacted-telegram-token>/getUpdates failed"
+        );
     }
 
     #[test]
