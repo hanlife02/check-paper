@@ -86,6 +86,7 @@ ppc serve-telegram
 ```
 
 `ppc authors` 会列出当前数据库中已经入库的作者和论文数。忘记作者名时先运行它，再把列表中的名字传给 `--author`；也可以用 `ppc config` 设置默认作者。
+如果运行 `ppc status`、`ppc ask`、`ppc analyze` 等命令时没有传 `--author` 且没有默认作者，CLI 会直接在错误信息里带上可用作者列表和下一步命令。
 
 一键同步新增论文并分析：
 

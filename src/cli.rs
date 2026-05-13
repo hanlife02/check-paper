@@ -1227,9 +1227,27 @@ fn resolve_author(author: Option<&str>, settings: &Settings) -> Result<String> {
     author
         .map(str::to_string)
         .or_else(|| settings.default_author.clone())
-        .ok_or_else(|| {
-            anyhow!("missing author; pass --author, run `ppc authors`, or set a default with `ppc config`")
-        })
+        .ok_or_else(|| anyhow!(missing_author_message(settings)))
+}
+
+fn missing_author_message(settings: &Settings) -> String {
+    let mut lines =
+        vec!["missing author; pass --author or set a default with `ppc config`.".to_string()];
+    lines.push(available_author_hint(settings));
+    lines.join("\n")
+}
+
+fn available_author_hint(settings: &Settings) -> String {
+    if !settings.db_path.exists() {
+        return "No author database found yet. Run `ppc scan`, then `ppc ingest --author AUTHOR` or `ppc sync --author AUTHOR`.".to_string();
+    }
+    match Storage::open(&settings.db_path).and_then(|storage| storage.authors()) {
+        Ok(authors) => format_authors(&authors, settings.default_author.as_deref()),
+        Err(err) => format!(
+            "Could not read authors from {}: {err}",
+            settings.db_path.display()
+        ),
+    }
 }
 
 fn require_llm(settings: &Settings) -> Result<()> {
@@ -1300,14 +1318,19 @@ fn make_optional_embedding(settings: &Settings) -> Result<Option<OpenAiCompatibl
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::{
         AskArgs, TelegramBotStatus, cmd_ask, format_authors, format_cli_chat_ids, format_tg_status,
-        redact_secret, resolve_author,
+        missing_author_message, redact_secret, resolve_author,
     };
     use crate::config::Settings;
+    use crate::papers::models::Paper;
     use crate::storage::AuthorSummary;
+    use crate::storage::Storage;
+    use serde_json::json;
+    use tempfile::tempdir;
 
     fn settings(default_author: Option<&str>) -> Settings {
         Settings {
@@ -1345,7 +1368,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing author"));
-        assert!(err.contains("ppc authors"));
+        assert!(err.contains("ppc ingest --author AUTHOR"));
         assert_eq!(
             resolve_author(Some("Alice"), &without_default).unwrap(),
             "Alice"
@@ -1353,6 +1376,26 @@ mod tests {
 
         let with_default = settings(Some("Bob"));
         assert_eq!(resolve_author(None, &with_default).unwrap(), "Bob");
+    }
+
+    #[test]
+    fn missing_author_message_lists_available_authors() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite");
+        let mut storage = Storage::open(&db_path).unwrap();
+        storage
+            .upsert_paper(&test_paper(dir.path(), "Alice", "paper-a"), &[])
+            .unwrap();
+        drop(storage);
+        let mut settings = settings(None);
+        settings.db_path = db_path;
+
+        let message = missing_author_message(&settings);
+
+        assert!(message.contains("missing author"));
+        assert!(message.contains("authors: 1"));
+        assert!(message.contains("1. Alice (1 papers)"));
+        assert!(message.contains("--author \"NAME\""));
     }
 
     #[test]
@@ -1429,5 +1472,24 @@ mod tests {
             redact_secret("https://api.telegram.org/bot123:secret/getMe", "123:secret"),
             "https://api.telegram.org/bot<redacted>/getMe"
         );
+    }
+
+    fn test_paper(root: &std::path::Path, author: &str, paper_id: &str) -> Paper {
+        Paper {
+            author: author.to_string(),
+            paper_id: paper_id.to_string(),
+            paper_dir: root.join(author).join(paper_id),
+            article_path: root.join(author).join(paper_id).join("article.md"),
+            fetch_result_path: None,
+            source_hash: format!("{author}-{paper_id}-hash"),
+            metadata: BTreeMap::from([
+                ("title".to_string(), format!("{author} {paper_id}")),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            fetch_result: json!({}),
+            raw_body: String::new(),
+            clean_text: String::new(),
+            sections: vec![],
+        }
     }
 }
