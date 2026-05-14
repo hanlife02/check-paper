@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::qa::renderer::render_qa_answer;
@@ -338,6 +338,7 @@ impl<'a> Answerer<'a> {
                 "chunk_hash": stored_chunk_hash(chunk),
                 "chunker_version": chunk.chunker_version,
             })).collect::<Vec<_>>(),
+            "trace_summary": retrieval_trace_summary(context.retrieval_trace),
             "trace": context.retrieval_trace,
         });
         let mut answer_json = parse_qa_answer(raw_answer)
@@ -398,6 +399,7 @@ impl<'a> Answerer<'a> {
                 "chunk_hash": stored_chunk_hash(chunk),
                 "chunker_version": chunk.chunker_version,
             })).collect::<Vec<_>>(),
+            "trace_summary": retrieval_trace_summary(context.retrieval_trace),
             "trace": context.retrieval_trace,
         });
         let answer_json = json!({
@@ -484,10 +486,7 @@ fn append_unique_chunks(
     }
 }
 
-fn evidence_snapshot(
-    answer_json: &serde_json::Value,
-    chunks: &[crate::storage::SourceChunk],
-) -> serde_json::Value {
+fn evidence_snapshot(answer_json: &Value, chunks: &[crate::storage::SourceChunk]) -> Value {
     let Some(evidence) = answer_json
         .get("evidence")
         .and_then(serde_json::Value::as_array)
@@ -519,6 +518,54 @@ fn evidence_snapshot(
     json!(items)
 }
 
+fn retrieval_trace_summary(trace: &Value) -> Value {
+    let mut routes = Map::new();
+    if let Some(route_map) = trace.get("routes").and_then(Value::as_object) {
+        for (route, candidates) in route_map {
+            let candidate_items = candidates.as_array();
+            let top = candidate_items.and_then(|items| items.first());
+            routes.insert(
+                route.clone(),
+                json!({
+                    "candidate_count": candidate_items.map_or(0, Vec::len),
+                    "top_paper_key": top
+                        .and_then(|item| item.get("paper_key"))
+                        .and_then(Value::as_str),
+                    "top_chunk_id": top
+                        .and_then(|item| item.get("chunk_id"))
+                        .and_then(Value::as_i64),
+                    "top_score": top
+                        .and_then(|item| item.get("score"))
+                        .and_then(Value::as_f64),
+                }),
+            );
+        }
+    }
+    let fusion_items = trace
+        .get("fusion")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(8)
+        .map(|item| {
+            json!({
+                "rank": item.get("rank").and_then(Value::as_i64),
+                "paper_key": item.get("paper_key").and_then(Value::as_str),
+                "chunk_id": item.get("chunk_id").and_then(Value::as_i64),
+                "score": item.get("score").and_then(Value::as_f64),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "routes": routes,
+        "fusion_count": trace
+            .get("fusion")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        "fusion": fusion_items,
+    })
+}
+
 fn chunk_hash(text: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(text.as_bytes());
@@ -541,7 +588,7 @@ fn text_excerpt(text: &str, max_chars: usize) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{evidence_snapshot, parse_qa_chunk_limit};
+    use super::{evidence_snapshot, parse_qa_chunk_limit, retrieval_trace_summary};
     use crate::qa::renderer::render_qa_answer;
     use crate::qa::verifier::verify_qa_answer;
     use crate::storage::SourceChunk;
@@ -689,6 +736,38 @@ mod tests {
                 .unwrap()
                 .contains("82% conversion")
         );
+    }
+
+    #[test]
+    fn retrieval_trace_summary_keeps_route_counts_and_fusion_scores() {
+        let summary = retrieval_trace_summary(&json!({
+            "routes": {
+                "fts": [
+                    {
+                        "rank": 1,
+                        "score": 0.016,
+                        "chunk_id": 7,
+                        "paper_key": "Alice/paper-a"
+                    }
+                ],
+                "like": []
+            },
+            "fusion": [
+                {
+                    "rank": 1,
+                    "score": 0.032,
+                    "chunk_id": 7,
+                    "paper_key": "Alice/paper-a"
+                }
+            ]
+        }));
+
+        assert_eq!(summary["routes"]["fts"]["candidate_count"], 1);
+        assert_eq!(summary["routes"]["fts"]["top_paper_key"], "Alice/paper-a");
+        assert_eq!(summary["routes"]["like"]["candidate_count"], 0);
+        assert_eq!(summary["fusion_count"], 1);
+        assert_eq!(summary["fusion"][0]["chunk_id"], 7);
+        assert!(summary["fusion"][0]["score"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
