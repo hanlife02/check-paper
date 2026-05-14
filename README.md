@@ -126,6 +126,8 @@ ppc eval --fixture tests/fixtures/golden_questions.json --top-k 8
 ppc eval --fixture tests/fixtures/golden_questions.json --trace
 ```
 
+`--trace` 会输出各检索 route 的候选、rank、RRF score，以及最终 fusion 排名。
+
 ## Telegram 用法
 
 ```text
