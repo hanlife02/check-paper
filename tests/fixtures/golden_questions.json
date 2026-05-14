@@ -138,5 +138,75 @@
     "must_cite": ["Alice/paper-e"],
     "must_include": ["publication bias"],
     "must_not_include": ["small batch reactor"]
+  },
+  {
+    "author": "Alice",
+    "question": "Compare the methods used by paper-a and paper-b.",
+    "must_cite": ["Alice/paper-a", "Alice/paper-b"],
+    "must_include": ["solvent screening", "in situ infrared"],
+    "must_not_include": ["graph neural network"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which papers mention small batch scale, short-duration runs, or long term cycling limitations?",
+    "must_cite": ["Alice/paper-a", "Alice/paper-b", "Alice/paper-d"],
+    "must_include": ["small batch scale", "short-duration runs", "long term cycling"],
+    "must_not_include": ["publication bias"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which studies include catalyst improvement evidence?",
+    "must_cite": ["Alice/paper-d", "Alice/paper-e"],
+    "must_include": ["lower charge transfer resistance", "15% median improvement"],
+    "must_not_include": ["500 adsorption isotherms"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which papers focus on prediction or statistical synthesis rather than direct spectroscopy?",
+    "must_cite": ["Alice/paper-c", "Alice/paper-e"],
+    "must_include": ["graph neural network", "random effects model"],
+    "must_not_include": ["in situ infrared tracking"]
+  },
+  {
+    "author": "Alice",
+    "question": "What do 82% conversion and MAE of 0.12 refer to in paper-a and paper-c?",
+    "must_cite": ["Alice/paper-a", "Alice/paper-c"],
+    "must_include": ["82% conversion", "MAE of 0.12"],
+    "must_not_include": ["publication bias"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which paper studies electrochemical performance under alkaline buffer and what method does it use?",
+    "must_cite": ["Alice/paper-d"],
+    "must_include": ["pH 9 buffer", "electrochemical impedance spectroscopy"],
+    "must_not_include": ["random effects model"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which paper uses adsorption isotherms and what limitation is noted?",
+    "must_cite": ["Alice/paper-c"],
+    "must_include": ["500 adsorption isotherms", "missing humidity effects"],
+    "must_not_include": ["short-duration runs"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which study uses a random effects model and what risk may inflate the estimate?",
+    "must_cite": ["Alice/paper-e"],
+    "must_include": ["random effects model", "publication bias"],
+    "must_not_include": ["oxygen vacancy"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which paper uses oxygen vacancy sites and what evidence duration caveat is reported?",
+    "must_cite": ["Alice/paper-b"],
+    "must_include": ["oxygen vacancy sites", "short-duration runs"],
+    "must_not_include": ["small batch scale"]
+  },
+  {
+    "author": "Alice",
+    "question": "Which papers report 82% conversion, MAE of 0.12, and lower charge transfer resistance?",
+    "must_cite": ["Alice/paper-a", "Alice/paper-c", "Alice/paper-d"],
+    "must_include": ["82% conversion", "MAE of 0.12", "lower charge transfer resistance"],
+    "must_not_include": ["publication bias"]
   }
 ]

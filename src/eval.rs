@@ -536,7 +536,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.total, 20);
+        assert_eq!(report.total, 30);
         assert_eq!(report.retrieval_hit_at_k, 1.0);
         assert!(report.citation_precision > 0.0);
         assert_eq!(report.answer_contains_required, 1.0);
