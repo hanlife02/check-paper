@@ -83,6 +83,7 @@ ppc ingest --author "Ruqiang ZOU"
 ppc analyze --author "Ruqiang ZOU" --limit 5
 ppc embed --author "Ruqiang ZOU"
 ppc ask --author "Ruqiang ZOU" "这个人的主要研究贡献是什么？"
+ppc backup
 ppc serve-telegram
 ```
 
@@ -111,6 +112,7 @@ ppc profile --author "Ruqiang ZOU" --rebuild
 
 ```bash
 ppc status --author "Ruqiang ZOU"
+ppc backup
 ppc jobs --author "Ruqiang ZOU" --status failed
 ppc jobs --author "Ruqiang ZOU" --retry-failed
 ppc jobs --cancel 123
@@ -119,6 +121,8 @@ ppc logs qa --errors
 ppc logs jobs --failed
 ppc logs jobs --errors
 ```
+
+生产全量运行前先执行 `ppc backup`，它会在当前配置的数据库同目录生成带时间戳的 SQLite 备份；也可以用 `ppc backup --output /path/to/check_paper.backup.sqlite` 指定备份路径。
 
 评测：
 

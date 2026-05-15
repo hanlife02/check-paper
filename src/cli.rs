@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Proxy;
@@ -7,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::thread;
 use std::time::Duration;
@@ -83,6 +85,8 @@ enum Command {
     Status(AuthorArgs),
     #[command(about = "Show or rebuild an author profile")]
     Profile(ProfileArgs),
+    #[command(about = "Create a SQLite database backup before full production runs")]
+    Backup(BackupArgs),
     #[command(about = "Start the Telegram bot polling loop")]
     ServeTelegram,
 }
@@ -91,6 +95,15 @@ enum Command {
 struct ConfigArgs {
     #[arg(long, help = "Print saved config values without prompting")]
     show: bool,
+}
+
+#[derive(Args)]
+struct BackupArgs {
+    #[arg(
+        long,
+        help = "Backup output path; defaults beside the configured database"
+    )]
+    output: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -321,6 +334,7 @@ pub fn run() -> Result<()> {
                 Command::Logs { command } => cmd_logs(command, &settings),
                 Command::Status(args) => cmd_status(args, &settings),
                 Command::Profile(args) => cmd_profile(args, &settings),
+                Command::Backup(args) => cmd_backup(args, &settings),
                 Command::ServeTelegram => cmd_serve_telegram(&settings),
                 Command::Config(_) | Command::Llm { .. } | Command::Tg { .. } => unreachable!(),
             }
@@ -1416,6 +1430,52 @@ fn cmd_profile(args: ProfileArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn cmd_backup(args: BackupArgs, settings: &Settings) -> Result<()> {
+    let backup_path = backup_database(&settings.db_path, args.output.as_deref())?;
+    println!("backup written: {}", backup_path.display());
+    Ok(())
+}
+
+fn backup_database(db_path: &Path, output: Option<&Path>) -> Result<PathBuf> {
+    if !db_path.exists() {
+        return Err(anyhow!(
+            "database not found: {}; run `ppc ingest` or `ppc sync` first",
+            db_path.display()
+        ));
+    }
+    let backup_path = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_backup_path(db_path));
+    if backup_path.exists() {
+        return Err(anyhow!(
+            "backup target already exists: {}",
+            backup_path.display()
+        ));
+    }
+    if let Some(parent) = backup_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute(
+        "VACUUM main INTO ?",
+        rusqlite::params![backup_path.to_string_lossy().as_ref()],
+    )?;
+    Ok(backup_path)
+}
+
+fn default_backup_path(db_path: &Path) -> PathBuf {
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let stem = db_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("check_paper");
+    let file_name = format!("{stem}-backup-{timestamp}.sqlite");
+    db_path
+        .parent()
+        .map(|parent| parent.join(&file_name))
+        .unwrap_or_else(|| PathBuf::from(file_name))
+}
+
 fn cmd_serve_telegram(settings: &Settings) -> Result<()> {
     require_llm(settings)?;
     let token = settings
@@ -1542,9 +1602,10 @@ mod tests {
 
     use super::{
         AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
-        analysis_failure_summary_lines, classify_analysis_error, cmd_ask, embed_batch_with_retries,
-        format_author_inventory, format_cli_chat_ids, format_tg_status, missing_author_message,
-        paper_root_authors, redact_secret, resolve_author, should_rebuild_author_profile,
+        analysis_failure_summary_lines, backup_database, classify_analysis_error, cmd_ask,
+        embed_batch_with_retries, format_author_inventory, format_cli_chat_ids, format_tg_status,
+        missing_author_message, paper_root_authors, redact_secret, resolve_author,
+        should_rebuild_author_profile,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
@@ -1682,6 +1743,29 @@ mod tests {
         assert_eq!(vectors, vec![vec![0.1, 0.2]]);
         assert_eq!(client.calls.get(), 2);
         assert_eq!(sleeps, vec![Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn backup_database_writes_sqlite_copy() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("source.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("CREATE TABLE items (name TEXT NOT NULL)", [])
+                .unwrap();
+            conn.execute("INSERT INTO items (name) VALUES ('paper-a')", [])
+                .unwrap();
+        }
+        let backup_path = dir.path().join("backups").join("source.backup.sqlite");
+
+        let written = backup_database(&db_path, Some(&backup_path)).unwrap();
+
+        assert_eq!(written, backup_path);
+        let conn = rusqlite::Connection::open(&written).unwrap();
+        let value: String = conn
+            .query_row("SELECT name FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "paper-a");
     }
 
     #[test]
