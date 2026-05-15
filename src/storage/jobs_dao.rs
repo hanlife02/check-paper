@@ -418,9 +418,12 @@ impl Storage {
                 r#"
                 UPDATE analysis_jobs
                 SET status = 'queued',
+                    attempt_count = 0,
                     last_error_code = NULL,
                     error = NULL,
                     next_retry_at = NULL,
+                    locked_by = NULL,
+                    lock_until = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 "#,
@@ -436,6 +439,74 @@ impl Storage {
                     params![paper_key],
                 )?;
             }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn retry_failed_analysis_jobs_for_candidates(
+        &self,
+        rows: &[AnalysisCandidate],
+        job_type: &str,
+        profile_schema_version: i64,
+        prompt_version: &str,
+        model_id: &str,
+        max_attempts: i64,
+    ) -> Result<usize> {
+        let mut count = 0usize;
+        for row in rows {
+            let job_id: Option<i64> = self
+                .conn
+                .query_row(
+                    r#"
+                    SELECT id
+                    FROM analysis_jobs
+                    WHERE paper_key = ? AND job_type = ? AND status = 'failed'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    "#,
+                    params![row.paper_key, job_type],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(job_id) = job_id else {
+                continue;
+            };
+            self.conn.execute(
+                r#"
+                UPDATE analysis_jobs
+                SET status = 'queued',
+                    source_hash = ?,
+                    profile_schema_version = ?,
+                    prompt_version = ?,
+                    model_id = ?,
+                    attempt_count = 0,
+                    max_attempts = ?,
+                    last_error_code = NULL,
+                    error = NULL,
+                    next_retry_at = NULL,
+                    locked_by = NULL,
+                    lock_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                "#,
+                params![
+                    row.source_hash,
+                    profile_schema_version,
+                    prompt_version,
+                    model_id,
+                    max_attempts,
+                    job_id
+                ],
+            )?;
+            self.conn.execute(
+                r#"
+                UPDATE papers
+                SET profile_status = 'queued', profile_error_code = NULL
+                WHERE paper_key = ?
+                "#,
+                params![row.paper_key],
+            )?;
             count += 1;
         }
         Ok(count)
@@ -468,9 +539,12 @@ impl Storage {
                 r#"
                 UPDATE analysis_jobs
                 SET status = 'queued',
+                    attempt_count = 0,
                     last_error_code = NULL,
                     error = NULL,
                     next_retry_at = NULL,
+                    locked_by = NULL,
+                    lock_until = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 "#,

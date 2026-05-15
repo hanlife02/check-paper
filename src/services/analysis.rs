@@ -54,12 +54,14 @@ impl<'a> AnalysisService<'a> {
             candidates.truncate(limit);
         }
         let retried = if options.failed_only {
-            let paper_keys = candidates
-                .iter()
-                .map(|candidate| candidate.paper_key.clone())
-                .collect::<Vec<_>>();
-            self.storage
-                .retry_failed_analysis_jobs_for_paper_keys(&paper_keys)?
+            self.storage.retry_failed_analysis_jobs_for_candidates(
+                &candidates,
+                "analyze",
+                PAPER_PROFILE_SCHEMA_VERSION,
+                PAPER_PROFILE_PROMPT_VERSION,
+                options.model_id,
+                options.max_attempts.max(1),
+            )?
         } else {
             0
         };
@@ -164,6 +166,46 @@ mod tests {
         assert_eq!(
             storage
                 .analysis_jobs(Some("Alice"), Some("queued"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_only_retries_legacy_failed_job_without_duplicate_queue() {
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        let paper = test_paper(dir.path(), "paper-a", "2024", "hash-a");
+        let chunks = chunk_paper(&paper, 3200, 350);
+        storage.upsert_paper(&paper, &chunks).unwrap();
+        storage
+            .record_analysis_job(&paper.key(), "analyze", "failed", Some("boom"))
+            .unwrap();
+
+        let plan = AnalysisService::new(&storage)
+            .enqueue_author("Alice", queue_options(true, false, false))
+            .unwrap();
+
+        assert_eq!(paper_ids(&plan), vec!["paper-a"]);
+        assert_eq!(plan.queued, 1);
+        assert_eq!(
+            storage
+                .analysis_jobs(Some("Alice"), Some("failed"), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            storage
+                .analysis_jobs(Some("Alice"), Some("queued"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .analysis_jobs(Some("Alice"), None, 10)
                 .unwrap()
                 .len(),
             1

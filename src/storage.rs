@@ -494,6 +494,139 @@ mod tests {
     }
 
     #[test]
+    fn retry_failed_jobs_reset_attempt_budget_and_locks() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        storage
+            .conn
+            .execute(
+                r#"
+                INSERT INTO analysis_jobs (
+                    paper_key, job_type, status, attempt_count, max_attempts,
+                    last_error_code, error, next_retry_at, locked_by, lock_until
+                )
+                VALUES (
+                    'Alice/paper-a', 'analyze', 'failed', 3, 3,
+                    'schema_error', 'bad json', '2099-01-01 00:00:00',
+                    'worker-a', '2099-01-01 00:00:00'
+                )
+                "#,
+                [],
+            )
+            .unwrap();
+
+        let retried = storage.retry_failed_analysis_jobs(None).unwrap();
+
+        assert_eq!(retried, 1);
+        struct RetriedJobState {
+            status: String,
+            attempt_count: i64,
+            error_code: Option<String>,
+            error: Option<String>,
+            next_retry_at: Option<String>,
+            locked_by: Option<String>,
+            lock_until: Option<String>,
+        }
+
+        let state: RetriedJobState = storage
+            .conn
+            .query_row(
+                r#"
+                SELECT status, attempt_count, last_error_code, error, next_retry_at,
+                       locked_by, lock_until
+                FROM analysis_jobs
+                "#,
+                [],
+                |row| {
+                    Ok(RetriedJobState {
+                        status: row.get(0)?,
+                        attempt_count: row.get(1)?,
+                        error_code: row.get(2)?,
+                        error: row.get(3)?,
+                        next_retry_at: row.get(4)?,
+                        locked_by: row.get(5)?,
+                        lock_until: row.get(6)?,
+                    })
+                },
+            )
+            .unwrap();
+
+        assert_eq!(state.status, "queued");
+        assert_eq!(state.attempt_count, 0);
+        assert_eq!(state.error_code, None);
+        assert_eq!(state.error, None);
+        assert_eq!(state.next_retry_at, None);
+        assert_eq!(state.locked_by, None);
+        assert_eq!(state.lock_until, None);
+    }
+
+    #[test]
+    fn retry_failed_analysis_candidates_refreshes_metadata_for_dedupe() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        insert_analysis_paper(&storage);
+        storage
+            .record_analysis_job("Alice/paper-a", "analyze", "failed", Some("boom"))
+            .unwrap();
+        let candidates = storage
+            .papers_needing_analysis("Alice", false, 7, "prompt-v2", "model-b", "chunker-v2")
+            .unwrap();
+
+        let retried = storage
+            .retry_failed_analysis_jobs_for_candidates(
+                &candidates,
+                "analyze",
+                7,
+                "prompt-v2",
+                "model-b",
+                5,
+            )
+            .unwrap();
+        let newly_queued = storage
+            .enqueue_analysis_jobs(&candidates, "analyze", 7, "prompt-v2", "model-b", 5)
+            .unwrap();
+
+        assert_eq!(retried, 1);
+        assert_eq!(newly_queued, 0);
+        let queued = storage.analysis_jobs(None, Some("queued"), 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        let (
+            source_hash,
+            profile_schema_version,
+            prompt_version,
+            model_id,
+            attempt_count,
+            max_attempts,
+        ): (String, i64, String, String, i64, i64) = storage
+            .conn
+            .query_row(
+                r#"
+                SELECT source_hash, profile_schema_version, prompt_version, model_id,
+                       attempt_count, max_attempts
+                FROM analysis_jobs
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(source_hash, "hash");
+        assert_eq!(profile_schema_version, 7);
+        assert_eq!(prompt_version, "prompt-v2");
+        assert_eq!(model_id, "model-b");
+        assert_eq!(attempt_count, 0);
+        assert_eq!(max_attempts, 5);
+    }
+
+    #[test]
     fn summarizes_analysis_job_error_counts() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
