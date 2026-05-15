@@ -539,20 +539,7 @@ mod tests {
     fn can_enqueue_claim_and_finish_analysis_jobs() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
-        storage
-            .conn
-            .execute(
-                r#"
-                INSERT INTO papers (
-                    paper_key, author, paper_id, title, doi, year, source_hash,
-                    article_path, metadata_json, fetch_result_json
-                )
-                VALUES ('Alice/paper-a', 'Alice', 'paper-a', 'A Paper', '10.1/test',
-                        '2024', 'hash', 'article.md', '{}', '{}')
-                "#,
-                [],
-            )
-            .unwrap();
+        insert_analysis_paper(&storage);
         let rows = storage
             .papers_needing_analysis("Alice", false, 1, "prompt-v1", "model-a", "chunker-v1")
             .unwrap();
@@ -604,6 +591,90 @@ mod tests {
             .unwrap();
         let succeeded = storage.analysis_jobs(None, Some("succeeded"), 10).unwrap();
         assert_eq!(succeeded.len(), 1);
+    }
+
+    #[test]
+    fn expired_running_analysis_job_can_be_reclaimed() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        insert_analysis_paper(&storage);
+        let rows = storage
+            .papers_needing_analysis("Alice", false, 1, "prompt-v1", "model-a", "chunker-v1")
+            .unwrap();
+        storage
+            .enqueue_analysis_jobs(&rows, "analyze", 1, "prompt-v1", "model-a", 3)
+            .unwrap();
+
+        let first = storage
+            .claim_next_analysis_job("Alice", "analyze", "worker-a", -60)
+            .unwrap()
+            .unwrap();
+        let second = storage
+            .claim_next_analysis_job("Alice", "analyze", "worker-b", 60)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.attempt_count, 1);
+    }
+
+    #[test]
+    fn retry_waiting_analysis_job_waits_until_next_retry_at() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        insert_analysis_paper(&storage);
+        let rows = storage
+            .papers_needing_analysis("Alice", false, 1, "prompt-v1", "model-a", "chunker-v1")
+            .unwrap();
+        storage
+            .enqueue_analysis_jobs(&rows, "analyze", 1, "prompt-v1", "model-a", 2)
+            .unwrap();
+        let task = storage
+            .claim_next_analysis_job("Alice", "analyze", "worker-a", 60)
+            .unwrap()
+            .unwrap();
+        let status = storage
+            .fail_analysis_job(task.id, "Alice/paper-a", "schema_error", "bad json")
+            .unwrap();
+        assert_eq!(status, "retry_waiting");
+
+        assert!(
+            storage
+                .claim_next_analysis_job("Alice", "analyze", "worker-b", 60)
+                .unwrap()
+                .is_none()
+        );
+        storage
+            .conn
+            .execute(
+                "UPDATE analysis_jobs SET next_retry_at = '2000-01-01 00:00:00' WHERE id = ?",
+                rusqlite::params![task.id],
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .claim_next_analysis_job("Alice", "analyze", "worker-b", 60)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn insert_analysis_paper(storage: &Storage) {
+        storage
+            .conn
+            .execute(
+                r#"
+                INSERT INTO papers (
+                    paper_key, author, paper_id, title, doi, year, source_hash,
+                    article_path, metadata_json, fetch_result_json
+                )
+                VALUES ('Alice/paper-a', 'Alice', 'paper-a', 'A Paper', '10.1/test',
+                        '2024', 'hash', 'article.md', '{}', '{}')
+                "#,
+                [],
+            )
+            .unwrap();
     }
 
     #[test]
