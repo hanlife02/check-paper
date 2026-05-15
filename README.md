@@ -84,6 +84,7 @@ ppc analyze --author "Ruqiang ZOU" --limit 5
 ppc embed --author "Ruqiang ZOU"
 ppc ask --author "Ruqiang ZOU" "这个人的主要研究贡献是什么？"
 ppc backup
+ppc preflight --author "Ruqiang ZOU" --limit 5
 ppc serve-telegram
 ```
 
@@ -123,6 +124,7 @@ ppc logs jobs --errors
 ```
 
 生产全量运行前先执行 `ppc backup`，它会在当前配置的数据库同目录生成带时间戳的 SQLite 备份；也可以用 `ppc backup --output /path/to/check_paper.backup.sqlite` 指定备份路径。
+再执行 `ppc preflight --author "Ruqiang ZOU" --limit 5` 查看全量前检查清单，包括数据库路径、建议备份路径、LLM/Embedding/TG 配置状态、论文与队列统计、计划处理规模和失败恢复命令。
 
 评测：
 

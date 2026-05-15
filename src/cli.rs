@@ -87,6 +87,8 @@ enum Command {
     Profile(ProfileArgs),
     #[command(about = "Create a SQLite database backup before full production runs")]
     Backup(BackupArgs),
+    #[command(about = "Print a production preflight checklist without running analysis")]
+    Preflight(PreflightArgs),
     #[command(about = "Start the Telegram bot polling loop")]
     ServeTelegram,
 }
@@ -104,6 +106,14 @@ struct BackupArgs {
         help = "Backup output path; defaults beside the configured database"
     )]
     output: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PreflightArgs {
+    #[arg(long, help = "Author directory under the paper root")]
+    author: Option<String>,
+    #[arg(long, help = "Maximum number of papers planned for the next sync")]
+    limit: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -335,6 +345,7 @@ pub fn run() -> Result<()> {
                 Command::Status(args) => cmd_status(args, &settings),
                 Command::Profile(args) => cmd_profile(args, &settings),
                 Command::Backup(args) => cmd_backup(args, &settings),
+                Command::Preflight(args) => cmd_preflight(args, &settings),
                 Command::ServeTelegram => cmd_serve_telegram(&settings),
                 Command::Config(_) | Command::Llm { .. } | Command::Tg { .. } => unreachable!(),
             }
@@ -1436,6 +1447,80 @@ fn cmd_backup(args: BackupArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn cmd_preflight(args: PreflightArgs, settings: &Settings) -> Result<()> {
+    let author = resolve_author(args.author.as_deref(), settings)?;
+    let storage = Storage::open(&settings.db_path)?;
+    let status = StatusService::new(&storage).summary(Some(&author))?;
+    println!(
+        "{}",
+        format_preflight_report(settings, &author, args.limit, &status)
+    );
+    Ok(())
+}
+
+fn format_preflight_report(
+    settings: &Settings,
+    author: &str,
+    limit: Option<usize>,
+    status: &crate::storage::LibraryStatus,
+) -> String {
+    let planned_papers = limit
+        .map(|limit| limit.min(status.stale_papers.max(0) as usize))
+        .unwrap_or(status.stale_papers.max(0) as usize);
+    let limit_arg = limit
+        .map(|limit| format!(" --limit {limit}"))
+        .unwrap_or_default();
+    let author_arg = quote_cli_arg(author);
+    [
+        "production preflight:".to_string(),
+        format!("db_path: {}", settings.db_path.display()),
+        format!(
+            "backup_path: {}",
+            default_backup_path(&settings.db_path).display()
+        ),
+        format!("paper_root: {}", settings.paper_root.display()),
+        format!("author: {author}"),
+        format!(
+            "llm_configured: {}",
+            yes_no(settings.llm_api_key.is_some() && !settings.llm_model.trim().is_empty())
+        ),
+        format!(
+            "embedding_configured: {}",
+            yes_no(
+                settings.embedding_provider == "openai-compatible"
+                    && settings.embedding_api_key.is_some()
+                    && !settings.embedding_model.trim().is_empty()
+            )
+        ),
+        format!(
+            "telegram_configured: {}",
+            yes_no(settings.telegram_bot_token.is_some())
+        ),
+        format!(
+            "telegram_allowed_chats: {}",
+            settings.telegram_chat_ids.len()
+        ),
+        format!("papers: {}", status.papers),
+        format!("analyzed: {}", status.analyzed),
+        format!("stale_papers: {}", status.stale_papers),
+        format!("queued_jobs: {}", status.queued_jobs),
+        format!("running_jobs: {}", status.running_jobs),
+        format!("retry_waiting_jobs: {}", status.retry_waiting_jobs),
+        format!("failed_jobs: {}", status.failed_jobs),
+        format!("planned_sync_papers: {planned_papers}"),
+        "next commands:".to_string(),
+        "ppc backup".to_string(),
+        format!("ppc sync --author {author_arg}{limit_arg}"),
+        format!("ppc jobs --author {author_arg} --status failed"),
+        format!("ppc analyze --author {author_arg} --failed-only"),
+    ]
+    .join("\n")
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
 fn backup_database(db_path: &Path, output: Option<&Path>) -> Result<PathBuf> {
     if !db_path.exists() {
         return Err(anyhow!(
@@ -1603,15 +1688,15 @@ mod tests {
     use super::{
         AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
         analysis_failure_summary_lines, backup_database, classify_analysis_error, cmd_ask,
-        embed_batch_with_retries, format_author_inventory, format_cli_chat_ids, format_tg_status,
-        missing_author_message, paper_root_authors, redact_secret, resolve_author,
-        should_rebuild_author_profile,
+        embed_batch_with_retries, format_author_inventory, format_cli_chat_ids,
+        format_preflight_report, format_tg_status, missing_author_message, paper_root_authors,
+        redact_secret, resolve_author, should_rebuild_author_profile,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
     use crate::retrieval::embedding::EmbeddingProvider;
-    use crate::storage::AuthorSummary;
     use crate::storage::Storage;
+    use crate::storage::{AuthorSummary, LibraryStatus};
     use indicatif::ProgressBar;
     use serde_json::json;
     use tempfile::tempdir;
@@ -1766,6 +1851,42 @@ mod tests {
             .query_row("SELECT name FROM items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "paper-a");
+    }
+
+    #[test]
+    fn preflight_report_summarizes_backup_and_next_commands() {
+        let mut settings = settings(Some("Alice"));
+        settings.db_path = PathBuf::from("data/check_paper.sqlite");
+        settings.llm_api_key = Some("secret".to_string());
+        settings.llm_model = "model-a".to_string();
+        settings.telegram_bot_token = Some("token".to_string());
+        settings.telegram_chat_ids = vec![7, 8];
+        let report = format_preflight_report(
+            &settings,
+            "Alice",
+            Some(5),
+            &LibraryStatus {
+                papers: 10,
+                analyzed: 4,
+                stale_papers: 6,
+                failed_jobs: 1,
+                queued_jobs: 2,
+                running_jobs: 0,
+                retry_waiting_jobs: 1,
+                cancelled_jobs: 0,
+                qa_logs: 3,
+                avg_qa_latency_ms: None,
+                total_qa_tokens: None,
+                total_qa_cost_usd: None,
+            },
+        );
+
+        assert!(report.contains("backup_path: data/check_paper-backup-"));
+        assert!(report.contains("llm_configured: yes"));
+        assert!(report.contains("telegram_allowed_chats: 2"));
+        assert!(report.contains("planned_sync_papers: 5"));
+        assert!(report.contains("ppc backup"));
+        assert!(report.contains("ppc sync --author \"Alice\" --limit 5"));
     }
 
     #[test]
