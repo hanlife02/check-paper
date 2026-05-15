@@ -17,7 +17,9 @@ use crate::config::{Settings, config_path, load_config, redacted_config, save_co
 use crate::papers::loader::load_paper;
 use crate::papers::scanner::scan_paper_dirs;
 use crate::retrieval::chunker::chunk_paper;
-use crate::retrieval::embedding::{EmbeddingConfig, OpenAiCompatibleEmbeddingClient};
+use crate::retrieval::embedding::{
+    EmbeddingConfig, EmbeddingProvider, OpenAiCompatibleEmbeddingClient,
+};
 use crate::schemas::paper_profile::PAPER_PROFILE_SCHEMA_VERSION;
 use crate::services::analysis::{AnalysisQueueOptions, AnalysisService};
 use crate::services::embedding::EmbeddingService;
@@ -188,6 +190,12 @@ struct EmbedArgs {
         help = "Refresh embeddings even when the stored model/version matches"
     )]
     force: bool,
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Maximum embedding API attempts per batch"
+    )]
+    max_attempts: usize,
 }
 
 #[derive(Args)]
@@ -1105,7 +1113,13 @@ fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
                 )
             })
             .collect::<Vec<_>>();
-        let vectors = match client.embed(&input) {
+        let vectors = match embed_batch_with_retries(
+            &client,
+            &input,
+            &progress,
+            args.max_attempts,
+            thread::sleep,
+        ) {
             Ok(vectors) => vectors,
             Err(err) => {
                 for item in batch {
@@ -1133,6 +1147,36 @@ fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
     }
     progress.finish_with_message("embedded chunks");
     Ok(())
+}
+
+fn embed_batch_with_retries<C, F>(
+    client: &C,
+    input: &[String],
+    progress: &ProgressBar,
+    max_attempts: usize,
+    mut sleep: F,
+) -> Result<Vec<Vec<f32>>>
+where
+    C: EmbeddingProvider,
+    F: FnMut(Duration),
+{
+    let max_attempts = max_attempts.max(1);
+    let mut last_error = None;
+    for attempt in 1..=max_attempts {
+        match client.embed(input) {
+            Ok(vectors) => return Ok(vectors),
+            Err(err) => {
+                progress.println(format!(
+                    "embedding batch attempt {attempt}/{max_attempts} failed: {err}"
+                ));
+                last_error = Some(err);
+                if attempt < max_attempts {
+                    sleep(Duration::from_secs(2 * attempt as u64));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("embedding failed")))
 }
 
 fn analyze_paper_with_retries(
@@ -1490,20 +1534,24 @@ fn make_optional_embedding(settings: &Settings) -> Result<Option<OpenAiCompatibl
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::{
         AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
-        analysis_failure_summary_lines, classify_analysis_error, cmd_ask, format_author_inventory,
-        format_cli_chat_ids, format_tg_status, missing_author_message, paper_root_authors,
-        redact_secret, resolve_author, should_rebuild_author_profile,
+        analysis_failure_summary_lines, classify_analysis_error, cmd_ask, embed_batch_with_retries,
+        format_author_inventory, format_cli_chat_ids, format_tg_status, missing_author_message,
+        paper_root_authors, redact_secret, resolve_author, should_rebuild_author_profile,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
+    use crate::retrieval::embedding::EmbeddingProvider;
     use crate::storage::AuthorSummary;
     use crate::storage::Storage;
+    use indicatif::ProgressBar;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1587,6 +1635,53 @@ mod tests {
         .to_string();
 
         assert!(err.contains("missing question"));
+    }
+
+    #[test]
+    fn embedding_batch_retry_succeeds_after_transient_failure() {
+        struct FlakyEmbedding {
+            calls: Cell<usize>,
+        }
+
+        impl EmbeddingProvider for FlakyEmbedding {
+            fn model_name(&self) -> &str {
+                "embed-model"
+            }
+
+            fn model_version(&self) -> Option<&str> {
+                Some("v1")
+            }
+
+            fn batch_size(&self) -> usize {
+                1
+            }
+
+            fn embed(&self, _input: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                let calls = self.calls.get() + 1;
+                self.calls.set(calls);
+                if calls == 1 {
+                    return Err(anyhow::anyhow!("temporary failure"));
+                }
+                Ok(vec![vec![0.1, 0.2]])
+            }
+        }
+
+        let client = FlakyEmbedding {
+            calls: Cell::new(0),
+        };
+        let mut sleeps = Vec::new();
+        let vectors = embed_batch_with_retries(
+            &client,
+            &["paper text".to_string()],
+            &ProgressBar::hidden(),
+            3,
+            |duration| sleeps.push(duration),
+        )
+        .unwrap();
+
+        assert_eq!(vectors, vec![vec![0.1, 0.2]]);
+        assert_eq!(client.calls.get(), 2);
+        assert_eq!(sleeps, vec![Duration::from_secs(2)]);
     }
 
     #[test]

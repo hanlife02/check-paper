@@ -72,6 +72,7 @@ CHECK_PAPER_EMBEDDING_MODEL=...
 ```
 
 可选项包括 `CHECK_PAPER_EMBEDDING_MODEL_VERSION`、`CHECK_PAPER_EMBEDDING_TIMEOUT_SECS`、`CHECK_PAPER_EMBEDDING_TLS_BACKEND`、`CHECK_PAPER_EMBEDDING_BATCH_SIZE`。
+运行 `ppc embed --author "Ruqiang ZOU" --limit 20 --max-attempts 3` 会按 batch size 分批写入 chunk embedding；每个 batch 失败会自动重试，最终失败会记录到 `embedding_jobs`，之后可重新运行 `ppc embed` 继续处理未成功的 chunk。
 
 ## 常用命令
 
