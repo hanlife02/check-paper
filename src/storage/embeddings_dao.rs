@@ -11,24 +11,34 @@ impl Storage {
         chunk_id: i64,
         model: &str,
         model_version: Option<&str>,
+        source_hash: &str,
         chunk_hash: &str,
     ) -> Result<bool> {
-        let current: Option<String> = self
+        let current: Option<i64> = self
             .conn
             .query_row(
                 r#"
-                SELECT chunk_hash
+                SELECT 1
                 FROM embeddings
                 WHERE target_type = 'chunk'
                   AND target_id = ?
                   AND model = ?
                   AND COALESCE(model_version, '') = COALESCE(?, '')
+                  AND COALESCE(source_hash, '') = ?
+                  AND COALESCE(chunk_hash, '') = ?
+                LIMIT 1
                 "#,
-                params![chunk_id.to_string(), model, model_version],
+                params![
+                    chunk_id.to_string(),
+                    model,
+                    model_version,
+                    source_hash,
+                    chunk_hash
+                ],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(current.as_deref() == Some(chunk_hash))
+        Ok(current.is_some())
     }
 
     pub fn save_chunk_embedding(

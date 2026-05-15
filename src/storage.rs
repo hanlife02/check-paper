@@ -1097,6 +1097,54 @@ mod tests {
     }
 
     #[test]
+    fn chunk_embedding_current_check_includes_source_hash() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        let mut chunk = SourceChunk {
+            id: 7,
+            paper_key: "Alice/paper-a".to_string(),
+            chunk_index: 0,
+            section: "Results".to_string(),
+            text: "chunk text".to_string(),
+            title: "A Paper".to_string(),
+            doi: "10.1/test".to_string(),
+            year: "2024".to_string(),
+            source_hash: "source-hash-a".to_string(),
+            chunk_hash: "chunk-hash".to_string(),
+            chunker_version: "section-char-v1".to_string(),
+            section_kind: "body".to_string(),
+            caption_label: None,
+        };
+        storage
+            .save_chunk_embedding(&chunk, "embed-model", Some("v1"), &[0.1, 0.2], "chunk-hash")
+            .unwrap();
+
+        assert!(
+            storage
+                .has_current_chunk_embedding(
+                    chunk.id,
+                    "embed-model",
+                    Some("v1"),
+                    "source-hash-a",
+                    "chunk-hash"
+                )
+                .unwrap()
+        );
+        chunk.source_hash = "source-hash-b".to_string();
+        assert!(
+            !storage
+                .has_current_chunk_embedding(
+                    chunk.id,
+                    "embed-model",
+                    Some("v1"),
+                    &chunk.source_hash,
+                    "chunk-hash"
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn upsert_paper_indexes_chunk_embeddings_for_hybrid_search() {
         let dir = tempdir().unwrap();
         let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();

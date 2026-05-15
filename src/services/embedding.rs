@@ -35,6 +35,7 @@ impl<'a> EmbeddingService<'a> {
                     chunk.id,
                     model,
                     model_version,
+                    &chunk.source_hash,
                     &chunk_hash,
                 )?
             {
