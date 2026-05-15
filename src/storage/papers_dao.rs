@@ -241,6 +241,12 @@ impl Storage {
             LEFT JOIN analysis_jobs j ON j.paper_key = p.paper_key
             WHERE p.author = ?
               AND (p.profile_status = 'failed' OR j.status = 'failed')
+              AND (
+                p.profile_json IS NULL
+                OR p.analyzed_hash IS NULL
+                OR p.analyzed_hash != p.source_hash
+                OR COALESCE(p.profile_status, '') != 'succeeded'
+              )
             ORDER BY p.year DESC, p.paper_id DESC
             "#,
         )?;

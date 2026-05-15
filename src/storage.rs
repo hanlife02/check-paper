@@ -692,6 +692,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_analysis_candidates_ignore_current_success_with_failed_history() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        storage
+            .conn
+            .execute(
+                r#"
+                INSERT INTO papers (
+                    paper_key, author, paper_id, title, doi, year, source_hash,
+                    article_path, metadata_json, fetch_result_json, profile_json,
+                    analyzed_hash, profile_status
+                )
+                VALUES (
+                    'Alice/paper-a', 'Alice', 'paper-a', 'A Paper', '10.1/test',
+                    '2024', 'hash', 'article.md', '{}', '{}', '{}',
+                    'hash', 'succeeded'
+                )
+                "#,
+                [],
+            )
+            .unwrap();
+        storage
+            .record_analysis_job("Alice/paper-a", "analyze", "failed", Some("old failure"))
+            .unwrap();
+
+        let rows = storage.failed_analysis_candidates("Alice").unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn can_enqueue_claim_and_finish_analysis_jobs() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
