@@ -5,6 +5,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::Value;
 
+mod chunk_classifications_dao;
 mod chunks_dao;
 mod embeddings_dao;
 mod facts_dao;
@@ -41,6 +42,31 @@ pub struct SourceChunk {
     pub chunker_version: String,
     pub section_kind: String,
     pub caption_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkClassification {
+    pub chunk_id: i64,
+    pub paper_key: String,
+    pub chunk_kind: String,
+    pub usefulness_score: f64,
+    pub skip_reason: Option<String>,
+    pub classifier_version: String,
+    pub source_hash: String,
+    pub chunk_hash: String,
+    pub classified_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewChunkClassification<'a> {
+    pub chunk_id: i64,
+    pub paper_key: &'a str,
+    pub chunk_kind: &'a str,
+    pub usefulness_score: f64,
+    pub skip_reason: Option<&'a str>,
+    pub classifier_version: &'a str,
+    pub source_hash: &'a str,
+    pub chunk_hash: &'a str,
 }
 
 pub struct Storage {
@@ -421,7 +447,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(migration_count, 2);
+        assert_eq!(migration_count, 3);
     }
 
     #[test]

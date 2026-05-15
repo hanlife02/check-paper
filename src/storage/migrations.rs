@@ -125,6 +125,7 @@ impl Storage {
         }
         self.apply_metadata_migrations()?;
         self.apply_embedding_contract_migration()?;
+        self.apply_chunk_classification_migration()?;
         Ok(())
     }
 
@@ -257,6 +258,56 @@ impl Storage {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_chunk_classification_migration(&self) -> Result<()> {
+        self.apply_migration(
+            3,
+            "chunk_classifications",
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_classifications (
+                chunk_id INTEGER PRIMARY KEY,
+                paper_key TEXT NOT NULL,
+                chunk_kind TEXT NOT NULL,
+                usefulness_score REAL NOT NULL,
+                skip_reason TEXT,
+                classifier_version TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                classified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_classifications_paper_key
+                ON chunk_classifications(paper_key);
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_classifications_kind
+                ON chunk_classifications(chunk_kind);
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_classifications (
+                chunk_id INTEGER PRIMARY KEY,
+                paper_key TEXT NOT NULL,
+                chunk_kind TEXT NOT NULL,
+                usefulness_score REAL NOT NULL,
+                skip_reason TEXT,
+                classifier_version TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                classified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_classifications_paper_key
+                ON chunk_classifications(paper_key);
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_classifications_kind
+                ON chunk_classifications(chunk_kind);
             "#,
         )?;
         Ok(())

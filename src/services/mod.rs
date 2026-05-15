@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod classification;
 pub mod embedding;
 pub mod eval;
 pub mod jobs;

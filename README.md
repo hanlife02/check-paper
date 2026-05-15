@@ -81,6 +81,7 @@ ppc authors
 ppc scan --author "Ruqiang ZOU"
 ppc ingest --author "Ruqiang ZOU"
 ppc analyze --author "Ruqiang ZOU" --limit 5
+ppc classify --author "Ruqiang ZOU"
 ppc embed --author "Ruqiang ZOU"
 ppc ask --author "Ruqiang ZOU" "这个人的主要研究贡献是什么？"
 ppc backup
@@ -98,6 +99,16 @@ ppc sync --author "Ruqiang ZOU"
 ```
 
 `ppc sync` 会显示入库和分析进度。分析阶段每篇论文都会显示独立的处理进度，当前论文完成后再进入下一篇；每篇论文会自动重试，单篇失败会记录后继续处理后续论文，最后汇总失败列表。之后重新运行 `ppc sync` 会继续重试未成功分析的论文。
+
+V2 理解层的第一步是 chunk 分类，不会改变当前问答默认行为：
+
+```bash
+ppc classify --author "Ruqiang ZOU"
+ppc classify --author "Ruqiang ZOU" --dry-run
+ppc classify --author "Ruqiang ZOU" --force
+```
+
+`classify` 会为已入库 chunks 写入确定性分类结果，包括 `chunk_kind`、`usefulness_score`、`skip_reason`、`classifier_version`、`source_hash` 和 `chunk_hash`。这些结果供后续 V2 chunk-level fact extraction 使用；当前 `ask` 和 Telegram 仍沿用现有检索问答链路。
 
 分析和维护常用参数：
 

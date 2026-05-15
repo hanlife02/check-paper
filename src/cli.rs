@@ -24,6 +24,9 @@ use crate::retrieval::embedding::{
 };
 use crate::schemas::paper_profile::PAPER_PROFILE_SCHEMA_VERSION;
 use crate::services::analysis::{AnalysisQueueOptions, AnalysisService};
+use crate::services::classification::{
+    ClassificationOptions, ClassificationReport, ClassificationService,
+};
 use crate::services::embedding::EmbeddingService;
 use crate::services::eval::EvalService;
 use crate::services::jobs::JobService;
@@ -68,6 +71,8 @@ enum Command {
     Analyze(AnalyzeArgs),
     #[command(about = "Run ingest and analyze in one step")]
     Sync(AnalyzeArgs),
+    #[command(about = "Classify chunks for the V2 comprehension pipeline")]
+    Classify(ClassifyArgs),
     #[command(about = "Create or refresh chunk embeddings")]
     Embed(EmbedArgs),
     #[command(about = "Ask a question about an author's papers")]
@@ -221,6 +226,24 @@ struct EmbedArgs {
     max_attempts: usize,
 }
 
+#[derive(Args, Clone)]
+struct ClassifyArgs {
+    #[arg(long, help = "Author directory under the paper root")]
+    author: Option<String>,
+    #[arg(long, help = "Maximum number of chunks to classify")]
+    limit: Option<usize>,
+    #[arg(
+        long,
+        help = "Reclassify chunks even when current classification exists"
+    )]
+    force: bool,
+    #[arg(
+        long,
+        help = "Print the classification plan without writing the database"
+    )]
+    dry_run: bool,
+}
+
 #[derive(Args)]
 struct AskArgs {
     #[arg(long, help = "Author directory under the paper root")]
@@ -337,6 +360,7 @@ pub fn run() -> Result<()> {
                     )?;
                     cmd_analyze(args, &settings)
                 }
+                Command::Classify(args) => cmd_classify(args, &settings),
                 Command::Embed(args) => cmd_embed(args, &settings),
                 Command::Ask(args) => cmd_ask(args, &settings),
                 Command::Eval(args) => cmd_eval(args, &settings),
@@ -1112,6 +1136,52 @@ fn should_rebuild_author_profile(skip_author_profile: bool, success_count: usize
     !skip_author_profile && success_count > 0
 }
 
+fn cmd_classify(args: ClassifyArgs, settings: &Settings) -> Result<()> {
+    let author = resolve_author(args.author.as_deref(), settings)?;
+    let storage = Storage::open(&settings.db_path)?;
+    let report = ClassificationService::new(&storage).classify_author(
+        &author,
+        ClassificationOptions {
+            limit: args.limit,
+            force: args.force,
+            dry_run: args.dry_run,
+        },
+    )?;
+    println!("{}", format_classification_report(&report));
+    Ok(())
+}
+
+fn format_classification_report(report: &ClassificationReport) -> String {
+    let mut lines = Vec::new();
+    let mode = if report.dry_run {
+        "chunk classification dry run:"
+    } else {
+        "chunk classification:"
+    };
+    lines.push(mode.to_string());
+    lines.push(format!("chunks_scanned: {}", report.chunks_scanned));
+    lines.push(format!("classified: {}", report.classified));
+    lines.push(format!("changed: {}", report.changed));
+    lines.push(format!("skipped_current: {}", report.skipped_current));
+    lines.push("by kind:".to_string());
+    if report.by_kind.is_empty() {
+        lines.push("- <none>: 0".to_string());
+    } else {
+        for (kind, count) in &report.by_kind {
+            lines.push(format!("- {kind}: {count}"));
+        }
+    }
+    lines.push("skip reasons:".to_string());
+    if report.skip_reasons.is_empty() {
+        lines.push("- <none>: 0".to_string());
+    } else {
+        for (reason, count) in &report.skip_reasons {
+            lines.push(format!("- {reason}: {count}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
     let author = resolve_author(args.author.as_deref(), settings)?;
     require_embedding(settings)?;
@@ -1688,13 +1758,14 @@ mod tests {
     use super::{
         AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
         analysis_failure_summary_lines, backup_database, classify_analysis_error, cmd_ask,
-        embed_batch_with_retries, format_author_inventory, format_cli_chat_ids,
-        format_preflight_report, format_tg_status, missing_author_message, paper_root_authors,
-        redact_secret, resolve_author, should_rebuild_author_profile,
+        embed_batch_with_retries, format_author_inventory, format_classification_report,
+        format_cli_chat_ids, format_preflight_report, format_tg_status, missing_author_message,
+        paper_root_authors, redact_secret, resolve_author, should_rebuild_author_profile,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
     use crate::retrieval::embedding::EmbeddingProvider;
+    use crate::services::classification::ClassificationReport;
     use crate::storage::Storage;
     use crate::storage::{AuthorSummary, LibraryStatus};
     use indicatif::ProgressBar;
@@ -1887,6 +1958,27 @@ mod tests {
         assert!(report.contains("planned_sync_papers: 5"));
         assert!(report.contains("ppc backup"));
         assert!(report.contains("ppc sync --author \"Alice\" --limit 5"));
+    }
+
+    #[test]
+    fn formats_classification_report_with_kind_and_skip_counts() {
+        let report = ClassificationReport {
+            chunks_scanned: 4,
+            classified: 3,
+            changed: 2,
+            skipped_current: 1,
+            by_kind: BTreeMap::from([("methods".to_string(), 1), ("results".to_string(), 2)]),
+            skip_reasons: BTreeMap::from([("reference_section".to_string(), 1)]),
+            dry_run: true,
+        };
+
+        let text = format_classification_report(&report);
+
+        assert!(text.contains("chunk classification dry run"));
+        assert!(text.contains("chunks_scanned: 4"));
+        assert!(text.contains("classified: 3"));
+        assert!(text.contains("- methods: 1"));
+        assert!(text.contains("- reference_section: 1"));
     }
 
     #[test]

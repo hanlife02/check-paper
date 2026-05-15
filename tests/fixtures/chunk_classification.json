@@ -1,0 +1,58 @@
+[
+  {
+    "section": "Abstract",
+    "section_kind": "body",
+    "text": "This paper studies solvent screening for MOF catalysis in a small batch reactor.",
+    "expected_kind": "abstract",
+    "expected_skip_reason": null
+  },
+  {
+    "section": "Methods",
+    "section_kind": "body",
+    "text": "The method combines in situ infrared tracking with temperature comparison under controlled gas flow.",
+    "expected_kind": "methods",
+    "expected_skip_reason": null
+  },
+  {
+    "section": "Results",
+    "section_kind": "body",
+    "text": "The best condition reports 82% conversion under mild conditions and improves selectivity.",
+    "expected_kind": "results",
+    "expected_skip_reason": null
+  },
+  {
+    "section": "Dataset",
+    "section_kind": "body",
+    "text": "The dataset contains 500 adsorption isotherms curated from porous materials.",
+    "expected_kind": "dataset",
+    "expected_skip_reason": null
+  },
+  {
+    "section": "Figure 2 Caption",
+    "section_kind": "figure_caption",
+    "text": "Figure 2: conversion trend under different solvent conditions.",
+    "expected_kind": "figure_caption",
+    "expected_skip_reason": null
+  },
+  {
+    "section": "References",
+    "section_kind": "body",
+    "text": "Smith J. Journal of Catalysis. 2020. Doe A. Materials Chemistry. 2021.",
+    "expected_kind": "bibliography_or_reference",
+    "expected_skip_reason": "reference_section"
+  },
+  {
+    "section": "Body",
+    "section_kind": "body",
+    "text": "Download PDF\nView article\nRights and permissions",
+    "expected_kind": "publisher_noise",
+    "expected_skip_reason": "publisher_noise"
+  },
+  {
+    "section": "Body",
+    "section_kind": "body",
+    "text": "Short note.",
+    "expected_kind": "low_information",
+    "expected_skip_reason": "very_short"
+  }
+]
