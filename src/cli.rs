@@ -886,6 +886,8 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
         queued = plan.queued
     );
     let mut failures = Vec::new();
+    let mut processed_count = 0usize;
+    let mut success_count = 0usize;
     let worker_id = format!("ppc-{}", process::id());
     let process_limit = plan.candidates.len();
     for index in 0..process_limit {
@@ -894,6 +896,7 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
         else {
             break;
         };
+        processed_count += 1;
         let row = task.candidate;
         let paper_dir = settings.paper_root.join(&row.author).join(&row.paper_id);
         let paper = load_paper(&settings.paper_root, &paper_dir)?;
@@ -938,6 +941,7 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
                 )?;
                 storage.complete_analysis_job(task.id, &paper.key())?;
                 progress.finish_with_message(format!("{message} done"));
+                success_count += 1;
             }
             Err(err) => {
                 progress.finish_with_message(format!("{message} failed"));
@@ -958,12 +962,13 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
         }
     }
     println!(
-        "analyzed {}; failed {}",
-        plan.candidates.len().saturating_sub(failures.len()),
+        "processed {}; succeeded {}; failed {}",
+        processed_count,
+        success_count,
         failures.len()
     );
 
-    if !args.skip_author_profile {
+    if should_rebuild_author_profile(args.skip_author_profile, success_count) {
         match ProfileService::new(&storage).rebuild_author_profile(&author, &llm, false)? {
             AuthorProfileRebuild::NoPaperProfiles => {}
             AuthorProfileRebuild::Current { .. } => {
@@ -973,6 +978,8 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
                 println!("updated author profile with {profile_count} paper profiles");
             }
         }
+    } else if !args.skip_author_profile {
+        println!("author profile rebuild skipped; no paper profiles changed in this run");
     }
     if !failures.is_empty() {
         for line in analysis_failure_summary_lines(&author, &failures) {
@@ -1066,6 +1073,10 @@ fn analysis_failure_summary_lines(author: &str, failures: &[AnalysisFailure]) ->
 
 fn quote_cli_arg(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+fn should_rebuild_author_profile(skip_author_profile: bool, success_count: usize) -> bool {
+    !skip_author_profile && success_count > 0
 }
 
 fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
@@ -1487,7 +1498,7 @@ mod tests {
         AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
         analysis_failure_summary_lines, classify_analysis_error, cmd_ask, format_author_inventory,
         format_cli_chat_ids, format_tg_status, missing_author_message, paper_root_authors,
-        redact_secret, resolve_author,
+        redact_secret, resolve_author, should_rebuild_author_profile,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
@@ -1619,6 +1630,13 @@ mod tests {
         assert!(text.contains("ppc jobs --author \"Alice\" --status failed"));
         assert!(text.contains("ppc analyze --author \"Alice\" --failed-only"));
         assert!(text.contains("Alice/paper-a [schema_error]"));
+    }
+
+    #[test]
+    fn author_profile_rebuild_only_runs_after_successful_paper_profiles() {
+        assert!(should_rebuild_author_profile(false, 1));
+        assert!(!should_rebuild_author_profile(false, 0));
+        assert!(!should_rebuild_author_profile(true, 1));
     }
 
     #[test]
