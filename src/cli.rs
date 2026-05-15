@@ -941,14 +941,19 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
             }
             Err(err) => {
                 progress.finish_with_message(format!("{message} failed"));
+                let error_code = classify_analysis_error(&err);
                 let status = storage.fail_analysis_job(
                     task.id,
                     &paper.key(),
-                    "analyze_error",
+                    error_code,
                     &err.to_string(),
                 )?;
                 progress.println(format!("job #{} marked {status}", task.id));
-                failures.push((paper.key(), err.to_string()));
+                failures.push(AnalysisFailure {
+                    paper_key: paper.key(),
+                    error_code,
+                    error: err.to_string(),
+                });
             }
         }
     }
@@ -970,18 +975,97 @@ fn cmd_analyze(args: AnalyzeArgs, settings: &Settings) -> Result<()> {
         }
     }
     if !failures.is_empty() {
-        println!(
-            "analysis completed with {} failed papers; rerun later to retry them",
-            failures.len()
-        );
-        for (paper_key, err) in failures.iter().take(20) {
-            println!("- {paper_key}: {err}");
-        }
-        if failures.len() > 20 {
-            println!("- ... {} more", failures.len() - 20);
+        for line in analysis_failure_summary_lines(&author, &failures) {
+            println!("{line}");
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AnalysisFailure {
+    paper_key: String,
+    error_code: &'static str,
+    error: String,
+}
+
+fn classify_analysis_error(error: &anyhow::Error) -> &'static str {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("；");
+    let lower = message.to_lowercase();
+    if lower.contains("missing check_paper_llm")
+        || lower.contains("invalid check_paper_llm_tls_backend")
+    {
+        "llm_config_error"
+    } else if message.contains("请求超时")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        "llm_timeout"
+    } else if message.contains("无法连接")
+        || lower.contains("connection refused")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("connect error")
+    {
+        "network_error"
+    } else if message.contains("LLM API 返回 HTTP") {
+        "llm_http_error"
+    } else if message.contains("LLM API 响应 JSON 解析失败") {
+        "llm_response_error"
+    } else if message.contains("PaperProfileV1")
+        || lower.contains("evidence_chunks")
+        || lower.contains("missing field")
+        || lower.contains("invalid type")
+    {
+        "schema_error"
+    } else {
+        "analyze_error"
+    }
+}
+
+fn analysis_failure_summary_lines(author: &str, failures: &[AnalysisFailure]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "analysis completed with {} failed attempts",
+        failures.len()
+    )];
+    let mut counts = BTreeMap::new();
+    for failure in failures {
+        *counts.entry(failure.error_code).or_insert(0usize) += 1;
+    }
+    lines.push("failure summary:".to_string());
+    for (error_code, count) in counts {
+        lines.push(format!("- {error_code}: {count}"));
+    }
+    let author_arg = quote_cli_arg(author);
+    lines.push("next steps:".to_string());
+    lines.push(format!(
+        "- Inspect failed jobs: ppc jobs --author {author_arg} --status failed"
+    ));
+    lines.push(format!(
+        "- Inspect retry-waiting jobs: ppc jobs --author {author_arg} --status retry_waiting"
+    ));
+    lines.push(format!(
+        "- Retry failed jobs: ppc analyze --author {author_arg} --failed-only"
+    ));
+    lines.push("failed attempts:".to_string());
+    for failure in failures.iter().take(20) {
+        lines.push(format!(
+            "- {} [{}]: {}",
+            failure.paper_key, failure.error_code, failure.error
+        ));
+    }
+    if failures.len() > 20 {
+        lines.push(format!("- ... {} more", failures.len() - 20));
+    }
+    lines
+}
+
+fn quote_cli_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
@@ -1400,7 +1484,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        AskArgs, PaperRootAuthorSummary, TelegramBotStatus, cmd_ask, format_author_inventory,
+        AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
+        analysis_failure_summary_lines, classify_analysis_error, cmd_ask, format_author_inventory,
         format_cli_chat_ids, format_tg_status, missing_author_message, paper_root_authors,
         redact_secret, resolve_author,
     };
@@ -1491,6 +1576,49 @@ mod tests {
         .to_string();
 
         assert!(err.contains("missing question"));
+    }
+
+    #[test]
+    fn classifies_analysis_errors_for_retry_visibility() {
+        assert_eq!(
+            classify_analysis_error(&anyhow::anyhow!("LLM API 请求超时：https://example.test")),
+            "llm_timeout"
+        );
+        assert_eq!(
+            classify_analysis_error(&anyhow::anyhow!("PaperProfileV1 missing non-empty title")),
+            "schema_error"
+        );
+        assert_eq!(
+            classify_analysis_error(&anyhow::anyhow!("LLM API 返回 HTTP 429：rate limited")),
+            "llm_http_error"
+        );
+    }
+
+    #[test]
+    fn formats_analysis_failure_summary_with_next_steps() {
+        let lines = analysis_failure_summary_lines(
+            "Alice",
+            &[
+                AnalysisFailure {
+                    paper_key: "Alice/paper-a".to_string(),
+                    error_code: "schema_error",
+                    error: "PaperProfileV1 missing non-empty title".to_string(),
+                },
+                AnalysisFailure {
+                    paper_key: "Alice/paper-b".to_string(),
+                    error_code: "llm_timeout",
+                    error: "LLM API 请求超时".to_string(),
+                },
+            ],
+        );
+        let text = lines.join("\n");
+
+        assert!(text.contains("analysis completed with 2 failed attempts"));
+        assert!(text.contains("- schema_error: 1"));
+        assert!(text.contains("- llm_timeout: 1"));
+        assert!(text.contains("ppc jobs --author \"Alice\" --status failed"));
+        assert!(text.contains("ppc analyze --author \"Alice\" --failed-only"));
+        assert!(text.contains("Alice/paper-a [schema_error]"));
     }
 
     #[test]
