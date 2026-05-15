@@ -169,12 +169,12 @@ pub(crate) fn decode_f32_vector(bytes: &[u8]) -> Option<Vec<f32>> {
         .collect()
 }
 
-pub(crate) fn rank_vector_chunks(
+pub(crate) fn rank_vector_chunks_with_scores(
     rows: Vec<(SourceChunk, Vec<u8>)>,
     query_vector: &[f32],
     limit: usize,
     require_same_dim: bool,
-) -> Vec<SourceChunk> {
+) -> Vec<(SourceChunk, f64)> {
     let mut scored = Vec::new();
     for (chunk, vector) in rows {
         if let Some(vector) = decode_f32_vector(&vector) {
@@ -183,7 +183,7 @@ pub(crate) fn rank_vector_chunks(
             }
             let score = cosine_similarity(query_vector, &vector);
             if score > 0.0 {
-                scored.push((score, chunk));
+                scored.push((score as f64, chunk));
             }
         }
     }
@@ -197,7 +197,7 @@ pub(crate) fn rank_vector_chunks(
     scored
         .into_iter()
         .take(limit)
-        .map(|(_, chunk)| chunk)
+        .map(|(score, chunk)| (chunk, score))
         .collect()
 }
 
@@ -299,7 +299,7 @@ struct EmbeddingItem {
 mod tests {
     use super::{
         decode_f32_vector, embeddings_endpoint, encode_f32_vector, local_hash_embedding,
-        rank_vector_chunks,
+        rank_vector_chunks_with_scores,
     };
     use crate::storage::SourceChunk;
 
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn rank_vector_chunks_orders_by_cosine_similarity() {
         let query = vec![1.0, 0.0];
-        let ranked = rank_vector_chunks(
+        let ranked = rank_vector_chunks_with_scores(
             vec![
                 (chunk(1), encode_f32_vector(&[0.1, 0.9])),
                 (chunk(2), encode_f32_vector(&[0.9, 0.1])),
@@ -350,6 +350,20 @@ mod tests {
             true,
         );
 
-        assert_eq!(ranked[0].id, 2);
+        assert_eq!(ranked[0].0.id, 2);
+    }
+
+    #[test]
+    fn rank_vector_chunks_can_return_similarity_scores() {
+        let query = vec![1.0, 0.0];
+        let ranked = rank_vector_chunks_with_scores(
+            vec![(chunk(1), encode_f32_vector(&[0.25, 0.75]))],
+            &query,
+            5,
+            true,
+        );
+
+        assert_eq!(ranked[0].0.id, 1);
+        assert!((ranked[0].1 - 0.25).abs() < f64::EPSILON);
     }
 }

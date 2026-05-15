@@ -1183,14 +1183,15 @@ mod tests {
             .unwrap();
         assert_eq!(parser_version, crate::papers::parser::PARSER_VERSION);
         assert_eq!(cleaner_version, crate::papers::cleaner::CLEANER_VERSION);
-        let rows = crate::retrieval::dense_route::search_local_hash_route(
+        let rows = crate::retrieval::dense_route::search_local_hash_route_with_scores(
             &storage,
             "Alice",
             "Zeolite conversion",
             5,
         )
         .unwrap();
-        assert_eq!(rows[0].paper_key, "Alice/paper-a");
+        assert_eq!(rows[0].chunk.paper_key, "Alice/paper-a");
+        assert!(rows[0].route_score.is_some());
     }
 
     #[test]
