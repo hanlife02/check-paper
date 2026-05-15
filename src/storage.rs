@@ -471,6 +471,29 @@ mod tests {
     }
 
     #[test]
+    fn retries_failed_analysis_jobs_for_selected_paper_keys() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        for paper_key in ["Alice/paper-a", "Alice/paper-b"] {
+            storage
+                .record_analysis_job(paper_key, "analyze", "failed", Some("boom"))
+                .unwrap();
+        }
+
+        let retried = storage
+            .retry_failed_analysis_jobs_for_paper_keys(&["Alice/paper-a".to_string()])
+            .unwrap();
+
+        assert_eq!(retried, 1);
+        let queued = storage.analysis_jobs(None, Some("queued"), 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].paper_key.as_deref(), Some("Alice/paper-a"));
+        let failed = storage.analysis_jobs(None, Some("failed"), 10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].paper_key.as_deref(), Some("Alice/paper-b"));
+    }
+
+    #[test]
     fn summarizes_analysis_job_error_counts() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();

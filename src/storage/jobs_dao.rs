@@ -440,4 +440,52 @@ impl Storage {
         }
         Ok(count)
     }
+
+    pub fn retry_failed_analysis_jobs_for_paper_keys(
+        &self,
+        paper_keys: &[String],
+    ) -> Result<usize> {
+        let mut count = 0usize;
+        for paper_key in paper_keys {
+            let job_id: Option<i64> = self
+                .conn
+                .query_row(
+                    r#"
+                    SELECT id
+                    FROM analysis_jobs
+                    WHERE paper_key = ? AND status = 'failed'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    "#,
+                    params![paper_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(job_id) = job_id else {
+                continue;
+            };
+            self.conn.execute(
+                r#"
+                UPDATE analysis_jobs
+                SET status = 'queued',
+                    last_error_code = NULL,
+                    error = NULL,
+                    next_retry_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                "#,
+                params![job_id],
+            )?;
+            self.conn.execute(
+                r#"
+                UPDATE papers
+                SET profile_status = 'queued', profile_error_code = NULL
+                WHERE paper_key = ?
+                "#,
+                params![paper_key],
+            )?;
+            count += 1;
+        }
+        Ok(count)
+    }
 }

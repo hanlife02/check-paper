@@ -53,6 +53,16 @@ impl<'a> AnalysisService<'a> {
         if let Some(limit) = options.limit {
             candidates.truncate(limit);
         }
+        let retried = if options.failed_only {
+            let paper_keys = candidates
+                .iter()
+                .map(|candidate| candidate.paper_key.clone())
+                .collect::<Vec<_>>();
+            self.storage
+                .retry_failed_analysis_jobs_for_paper_keys(&paper_keys)?
+        } else {
+            0
+        };
         let queued = self.storage.enqueue_analysis_jobs(
             &candidates,
             "analyze",
@@ -61,7 +71,10 @@ impl<'a> AnalysisService<'a> {
             options.model_id,
             options.max_attempts.max(1),
         )?;
-        Ok(AnalysisQueuePlan { candidates, queued })
+        Ok(AnalysisQueuePlan {
+            candidates,
+            queued: queued + retried,
+        })
     }
 }
 
@@ -141,6 +154,20 @@ mod tests {
 
         assert_eq!(paper_ids(&plan), vec!["paper-c"]);
         assert_eq!(plan.queued, 1);
+        assert_eq!(
+            storage
+                .analysis_jobs(Some("Alice"), Some("failed"), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            storage
+                .analysis_jobs(Some("Alice"), Some("queued"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
