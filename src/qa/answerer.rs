@@ -7,11 +7,15 @@ use sha2::{Digest, Sha256};
 use crate::qa::renderer::render_qa_answer;
 use crate::qa::verifier::{parse_qa_answer, verify_qa_answer};
 use crate::retrieval::embedding::OpenAiCompatibleEmbeddingClient;
-use crate::retrieval::profile_route::search_profiles_for_query;
+use crate::retrieval::profile_route::rank_profiles;
+use crate::retrieval::query::query_terms;
+use crate::schemas::author_profile::AUTHOR_PROFILE_SCHEMA_VERSION;
 use crate::schemas::qa_answer::{QA_ANSWER_SCHEMA_VERSION, signals_insufficient};
 use crate::storage::{QaLogEntry, QaLogMetadata, SourceChunk, Storage};
 use crate::understanding::llm::{LlmUsage, OpenAiCompatibleClient};
-use crate::understanding::prompts::{QA_PROMPT_VERSION, qa_messages, qa_repair_messages};
+use crate::understanding::prompts::{
+    AUTHOR_PROFILE_PROMPT_VERSION, QA_PROMPT_VERSION, qa_messages, qa_repair_messages,
+};
 
 const PROFILE_CONTEXT_LIMIT: usize = 8;
 const DEFAULT_CHUNK_LIMIT: usize = 8;
@@ -21,6 +25,7 @@ const QA_CHUNK_LIMIT_ENV: &str = "CHECK_PAPER_QA_CHUNK_LIMIT";
 struct AnswerLogContext<'a> {
     author: &'a str,
     question: &'a str,
+    author_profile: Option<&'a serde_json::Value>,
     profiles: &'a [serde_json::Value],
     chunks: &'a [SourceChunk],
     retrieval_trace: &'a serde_json::Value,
@@ -58,21 +63,24 @@ impl<'a> Answerer<'a> {
 
     pub fn answer(&self, author: &str, question: &str) -> Result<String> {
         let started = Instant::now();
-        let profiles =
-            search_profiles_for_query(self.storage, author, question, PROFILE_CONTEXT_LIMIT)?;
+        let (author_profile, profiles) = self.profile_context(author, question)?;
         let chunk_limit = qa_chunk_limit();
         let (mut chunks, mut retrieval_trace) =
             self.context_chunks(author, question, &profiles, chunk_limit)?;
 
-        let first =
-            self.llm
-                .chat_with_usage(qa_messages(question, &profiles, &chunks), 0.2, 2200)?;
+        let first = self.llm.chat_with_usage(
+            qa_messages(question, author_profile.as_ref(), &profiles, &chunks),
+            0.2,
+            2200,
+        )?;
         if should_retry_with_more_chunks(&first.content, &chunks) {
             (chunks, retrieval_trace) =
                 self.context_chunks(author, question, &profiles, retry_chunk_limit(chunk_limit))?;
-            let second =
-                self.llm
-                    .chat_with_usage(qa_messages(question, &profiles, &chunks), 0.2, 2600)?;
+            let second = self.llm.chat_with_usage(
+                qa_messages(question, author_profile.as_ref(), &profiles, &chunks),
+                0.2,
+                2600,
+            )?;
             let repaired = match self.valid_or_repaired_answer(&second.content, &chunks) {
                 Ok(answer) => answer,
                 Err(err) => {
@@ -80,6 +88,7 @@ impl<'a> Answerer<'a> {
                         AnswerLogContext {
                             author,
                             question,
+                            author_profile: author_profile.as_ref(),
                             profiles: &profiles,
                             chunks: &chunks,
                             retrieval_trace: &retrieval_trace,
@@ -97,6 +106,7 @@ impl<'a> Answerer<'a> {
                 AnswerLogContext {
                     author,
                     question,
+                    author_profile: author_profile.as_ref(),
                     profiles: &profiles,
                     chunks: &chunks,
                     retrieval_trace: &retrieval_trace,
@@ -115,6 +125,7 @@ impl<'a> Answerer<'a> {
                     AnswerLogContext {
                         author,
                         question,
+                        author_profile: author_profile.as_ref(),
                         profiles: &profiles,
                         chunks: &chunks,
                         retrieval_trace: &retrieval_trace,
@@ -132,6 +143,7 @@ impl<'a> Answerer<'a> {
             AnswerLogContext {
                 author,
                 question,
+                author_profile: author_profile.as_ref(),
                 profiles: &profiles,
                 chunks: &chunks,
                 retrieval_trace: &retrieval_trace,
@@ -154,8 +166,7 @@ impl<'a> Answerer<'a> {
         F: FnMut(&str) -> Result<()>,
     {
         let started = Instant::now();
-        let profiles =
-            search_profiles_for_query(self.storage, author, question, PROFILE_CONTEXT_LIMIT)?;
+        let (author_profile, profiles) = self.profile_context(author, question)?;
         let chunk_limit = qa_chunk_limit();
         let (mut chunks, mut retrieval_trace) =
             self.context_chunks(author, question, &profiles, chunk_limit)?;
@@ -163,7 +174,7 @@ impl<'a> Answerer<'a> {
         let first = self
             .llm
             .chat_stream(
-                qa_messages(question, &profiles, &chunks),
+                qa_messages(question, author_profile.as_ref(), &profiles, &chunks),
                 0.2,
                 2200,
                 |delta| on_delta(delta),
@@ -175,7 +186,7 @@ impl<'a> Answerer<'a> {
             let second = self
                 .llm
                 .chat_stream(
-                    qa_messages(question, &profiles, &chunks),
+                    qa_messages(question, author_profile.as_ref(), &profiles, &chunks),
                     0.2,
                     2600,
                     |delta| on_delta(delta),
@@ -188,6 +199,7 @@ impl<'a> Answerer<'a> {
                         AnswerLogContext {
                             author,
                             question,
+                            author_profile: author_profile.as_ref(),
                             profiles: &profiles,
                             chunks: &chunks,
                             retrieval_trace: &retrieval_trace,
@@ -205,6 +217,7 @@ impl<'a> Answerer<'a> {
                 AnswerLogContext {
                     author,
                     question,
+                    author_profile: author_profile.as_ref(),
                     profiles: &profiles,
                     chunks: &chunks,
                     retrieval_trace: &retrieval_trace,
@@ -223,6 +236,7 @@ impl<'a> Answerer<'a> {
                     AnswerLogContext {
                         author,
                         question,
+                        author_profile: author_profile.as_ref(),
                         profiles: &profiles,
                         chunks: &chunks,
                         retrieval_trace: &retrieval_trace,
@@ -240,6 +254,7 @@ impl<'a> Answerer<'a> {
             AnswerLogContext {
                 author,
                 question,
+                author_profile: author_profile.as_ref(),
                 profiles: &profiles,
                 chunks: &chunks,
                 retrieval_trace: &retrieval_trace,
@@ -250,6 +265,35 @@ impl<'a> Answerer<'a> {
             &repaired,
         )?;
         Ok(render_qa_answer(&repaired))
+    }
+
+    fn profile_context(
+        &self,
+        author: &str,
+        question: &str,
+    ) -> Result<(Option<serde_json::Value>, Vec<serde_json::Value>)> {
+        let all_profiles = self.storage.paper_profiles(author, None)?;
+        let author_profile = if all_profiles.is_empty() {
+            None
+        } else {
+            let source_profile_hash = profile_source_hash(&all_profiles)?;
+            if self.storage.author_profile_is_current(
+                author,
+                AUTHOR_PROFILE_SCHEMA_VERSION,
+                AUTHOR_PROFILE_PROMPT_VERSION,
+                self.llm.model_name(),
+                &source_profile_hash,
+            )? {
+                self.storage.get_author_profile(author)?
+            } else {
+                None
+            }
+        };
+        let terms = query_terms(question);
+        Ok((
+            author_profile,
+            rank_profiles(all_profiles, &terms, PROFILE_CONTEXT_LIMIT),
+        ))
     }
 
     fn context_chunks(
@@ -323,6 +367,7 @@ impl<'a> Answerer<'a> {
 
     fn log_answer(&self, context: AnswerLogContext<'_>, raw_answer: &str) -> Result<()> {
         let retrieval = json!({
+            "author_profile_present": context.author_profile.is_some(),
             "profile_count": context.profiles.len(),
             "chunks": context.chunks.iter().map(|chunk| json!({
                 "paper_key": chunk.paper_key,
@@ -384,6 +429,7 @@ impl<'a> Answerer<'a> {
         error: &str,
     ) -> Result<()> {
         let retrieval = json!({
+            "author_profile_present": context.author_profile.is_some(),
             "profile_count": context.profiles.len(),
             "chunks": context.chunks.iter().map(|chunk| json!({
                 "paper_key": chunk.paper_key,
@@ -572,6 +618,10 @@ fn chunk_hash(text: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn profile_source_hash(profiles: &[serde_json::Value]) -> Result<String> {
+    Ok(chunk_hash(&serde_json::to_string(profiles)?))
+}
+
 fn stored_chunk_hash(chunk: &crate::storage::SourceChunk) -> String {
     if chunk.chunk_hash.trim().is_empty() {
         chunk_hash(&chunk.text)
@@ -587,11 +637,23 @@ fn text_excerpt(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tempfile::tempdir;
 
-    use super::{evidence_snapshot, parse_qa_chunk_limit, retrieval_trace_summary};
+    use super::{
+        Answerer, evidence_snapshot, parse_qa_chunk_limit, profile_source_hash,
+        retrieval_trace_summary,
+    };
+    use crate::papers::models::Paper;
     use crate::qa::renderer::render_qa_answer;
     use crate::qa::verifier::verify_qa_answer;
-    use crate::storage::SourceChunk;
+    use crate::retrieval::chunker::chunk_paper;
+    use crate::schemas::author_profile::AUTHOR_PROFILE_SCHEMA_VERSION;
+    use crate::schemas::paper_profile::PAPER_PROFILE_SCHEMA_VERSION;
+    use crate::storage::{PaperProfileMetadata, SourceChunk, Storage};
+    use crate::understanding::llm::{LlmConfig, OpenAiCompatibleClient};
+    use crate::understanding::prompts::{
+        AUTHOR_PROFILE_PROMPT_VERSION, PAPER_PROFILE_PROMPT_VERSION,
+    };
 
     #[test]
     fn renders_structured_qa_answer_with_evidence() {
@@ -776,5 +838,97 @@ mod tests {
         assert_eq!(parse_qa_chunk_limit(Some("12".to_string())), 12);
         assert_eq!(parse_qa_chunk_limit(Some("0".to_string())), 8);
         assert_eq!(parse_qa_chunk_limit(Some("31".to_string())), 8);
+    }
+
+    #[test]
+    fn profile_context_uses_only_current_author_profile() {
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        let paper = Paper {
+            author: "Alice".to_string(),
+            paper_id: "paper-a".to_string(),
+            paper_dir: dir.path().to_path_buf(),
+            article_path: dir.path().join("article.md"),
+            fetch_result_path: None,
+            source_hash: "source-a".to_string(),
+            metadata: std::collections::BTreeMap::from([
+                ("title".to_string(), "MOF Paper".to_string()),
+                ("doi".to_string(), "10.1/test".to_string()),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            fetch_result: json!({}),
+            raw_body: String::new(),
+            clean_text: "MOF catalysis result.".to_string(),
+            sections: Vec::new(),
+        };
+        let chunks = chunk_paper(&paper, 3200, 350);
+        storage.upsert_paper(&paper, &chunks).unwrap();
+        storage
+            .save_paper_profile_with_metadata(
+                &paper.key(),
+                &json!({
+                    "paper_key": paper.key(),
+                    "title": "MOF Paper",
+                    "doi": "10.1/test",
+                    "year": "2024",
+                    "one_sentence_summary": "MOF catalysis.",
+                    "methods": [{"method": "tested MOFs", "evidence_chunks": [0]}],
+                    "topic_keywords": ["MOF"]
+                }),
+                PaperProfileMetadata {
+                    source_hash: &paper.source_hash,
+                    schema_version: PAPER_PROFILE_SCHEMA_VERSION,
+                    prompt_version: PAPER_PROFILE_PROMPT_VERSION,
+                    model_id: "test-model",
+                    chunker_version: "section-char-v1",
+                },
+            )
+            .unwrap();
+        let profiles = storage.paper_profiles("Alice", None).unwrap();
+        let source_profile_hash = profile_source_hash(&profiles).unwrap();
+        storage
+            .save_author_profile_with_metadata(
+                "Alice",
+                &json!({"author": "Alice", "answer_scope": ["MOF catalysis"]}),
+                AUTHOR_PROFILE_SCHEMA_VERSION,
+                AUTHOR_PROFILE_PROMPT_VERSION,
+                "test-model",
+                &source_profile_hash,
+            )
+            .unwrap();
+        let answerer = Answerer::new(&storage, test_llm("test-model"));
+
+        let (author_profile, ranked_profiles) = answerer.profile_context("Alice", "MOF").unwrap();
+
+        assert!(author_profile.is_some());
+        assert_eq!(ranked_profiles.len(), 1);
+
+        storage
+            .save_author_profile_with_metadata(
+                "Alice",
+                &json!({"author": "Alice", "answer_scope": ["stale"]}),
+                AUTHOR_PROFILE_SCHEMA_VERSION,
+                AUTHOR_PROFILE_PROMPT_VERSION,
+                "old-model",
+                &source_profile_hash,
+            )
+            .unwrap();
+        let (author_profile, _) = answerer.profile_context("Alice", "MOF").unwrap();
+
+        assert!(author_profile.is_none());
+    }
+
+    fn test_llm(model: &str) -> OpenAiCompatibleClient {
+        OpenAiCompatibleClient::new(LlmConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            api_key: None,
+            model: model.to_string(),
+            proxy: None,
+            timeout_secs: 1,
+            tls_backend: "rustls".to_string(),
+            prompt_cost_per_1k: None,
+            completion_cost_per_1k: None,
+        })
+        .unwrap()
     }
 }

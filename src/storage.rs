@@ -339,6 +339,55 @@ mod tests {
     }
 
     #[test]
+    fn chunks_for_paper_keys_prefers_meaningful_body_over_metadata() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        for (paper_key, paper_id) in [("Alice/paper-a", "paper-a"), ("Alice/paper-b", "paper-b")] {
+            storage
+                .conn
+                .execute(
+                    r#"
+                    INSERT INTO papers (
+                        paper_key, author, paper_id, title, doi, year, source_hash,
+                        article_path, metadata_json, fetch_result_json
+                    )
+                    VALUES (?, 'Alice', ?, 'A Paper', '10.1/test', '2024',
+                            'hash', 'article.md', '{}', '{}')
+                    "#,
+                    rusqlite::params![paper_key, paper_id],
+                )
+                .unwrap();
+        }
+        storage
+            .conn
+            .execute(
+                r#"
+                INSERT INTO chunks (paper_key, chunk_index, section, text, section_kind)
+                VALUES
+                    ('Alice/paper-a', 0, 'Metadata', 'Title: A Paper DOI: 10.1/test', 'body'),
+                    ('Alice/paper-a', 1, 'Abstract', 'Abstract This paper reports a catalytic synthesis result with detailed evidence.', 'body'),
+                    ('Alice/paper-b', 0, 'Body', 'This one-chunk paper still has useful body text.', 'body')
+                "#,
+                [],
+            )
+            .unwrap();
+
+        let chunks = storage
+            .chunks_for_paper_keys(
+                &["Alice/paper-a".to_string(), "Alice/paper-b".to_string()],
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].paper_key, "Alice/paper-a");
+        assert_eq!(chunks[0].chunk_index, 1);
+        assert!(chunks[0].text.contains("Abstract This paper"));
+        assert_eq!(chunks[1].paper_key, "Alice/paper-b");
+        assert_eq!(chunks[1].chunk_index, 0);
+    }
+
+    #[test]
     fn records_qa_log_usage_metadata() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();

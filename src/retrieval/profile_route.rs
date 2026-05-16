@@ -1,18 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::retrieval::query::query_terms;
 use crate::storage::Storage;
-
-pub(crate) fn search_profiles_for_query(
-    storage: &Storage,
-    author: &str,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<Value>> {
-    let terms = query_terms(query);
-    search_profile_route(storage, author, &terms, limit)
-}
 
 pub(crate) fn search_profile_route(
     storage: &Storage,

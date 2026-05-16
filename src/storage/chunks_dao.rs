@@ -26,7 +26,22 @@ impl Storage {
                 FROM chunks c
                 JOIN papers p ON p.paper_key = c.paper_key
                 WHERE c.paper_key = ?
-                ORDER BY c.chunk_index ASC
+                ORDER BY
+                    CASE
+                        WHEN COALESCE(c.section_kind, 'body') NOT IN ('figure_caption', 'table_caption')
+                             AND c.chunk_index > 0
+                             AND lower(c.section || ' ' || c.text) LIKE '%abstract%' THEN 0
+                        WHEN COALESCE(c.section_kind, 'body') NOT IN ('figure_caption', 'table_caption')
+                             AND c.chunk_index > 0
+                             AND lower(c.section || ' ' || c.text) LIKE '%introduction%' THEN 1
+                        WHEN COALESCE(c.section_kind, 'body') NOT IN ('figure_caption', 'table_caption')
+                             AND c.chunk_index > 0 THEN 2
+                        WHEN COALESCE(c.section_kind, 'body') NOT IN ('figure_caption', 'table_caption')
+                             AND lower(c.section || ' ' || c.text) LIKE '%abstract%' THEN 3
+                        WHEN COALESCE(c.section_kind, 'body') NOT IN ('figure_caption', 'table_caption') THEN 4
+                        ELSE 5
+                    END,
+                    c.chunk_index ASC
                 LIMIT 1
                 "#,
             )?;

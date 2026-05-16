@@ -7,8 +7,8 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, ClientBuilder, Proxy};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::time::{Instant, sleep};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::time::sleep;
 
 use super::dispatcher::{ChatDispatcher, DispatchAction};
 use super::handlers::BotHandlers;
@@ -18,7 +18,6 @@ const TELEGRAM_REQUEST_TIMEOUT_SECS: u64 = TELEGRAM_POLL_TIMEOUT_SECS + 20;
 const TELEGRAM_POLL_RETRY_DELAY_SECS: u64 = 3;
 const TELEGRAM_MESSAGE_PREVIEW_CHARS: usize = 80;
 const TELEGRAM_MAX_MESSAGE_CHARS: usize = 3900;
-const TELEGRAM_STREAM_EDIT_INTERVAL_MS: u64 = 1100;
 const TELEGRAM_STREAM_PLACEHOLDER: &str = "处理中...";
 const TELEGRAM_DEFAULT_429_BACKOFF_SECS: u64 = 3;
 const TELEGRAM_LLM_CONCURRENCY: usize = 2;
@@ -27,7 +26,7 @@ const TELEGRAM_LLM_CONCURRENCY: usize = 2;
 pub struct TelegramBot {
     token: String,
     allowed_chat_ids: Vec<i64>,
-    handlers: BotHandlers,
+    handlers: Arc<BotHandlers>,
     http: Client,
     cancelled_jobs: Arc<Mutex<HashSet<u64>>>,
     llm_semaphore: Arc<Semaphore>,
@@ -43,7 +42,7 @@ impl TelegramBot {
         Ok(Self {
             token,
             allowed_chat_ids,
-            handlers,
+            handlers: Arc::new(handlers),
             http: http_client(proxy.as_deref())?,
             cancelled_jobs: Arc::new(Mutex::new(HashSet::new())),
             llm_semaphore: Arc::new(Semaphore::new(TELEGRAM_LLM_CONCURRENCY)),
@@ -213,10 +212,7 @@ impl TelegramBot {
         if should_stream_text(&text) {
             self.send_streaming_reply(chat_id, job_id, &text).await?;
         } else {
-            let reply = self
-                .handlers
-                .handle_text(chat_id, &text)
-                .unwrap_or_else(|err| format!("处理失败：{err}"));
+            let reply = self.handle_text_blocking(chat_id, text).await?;
             if !self.is_job_cancelled(job_id) {
                 self.send_long_message(chat_id, &reply).await?;
             }
@@ -229,58 +225,30 @@ impl TelegramBot {
         let placeholder = self
             .send_message(chat_id, TELEGRAM_STREAM_PLACEHOLDER)
             .await?;
-        let editor = TelegramMessageEditor {
-            token: self.token.clone(),
-            http: self.http.clone(),
-            chat_id,
-            message_id: placeholder.message_id,
-        };
-        let (tx, rx) = unbounded_channel();
-        let edit_task = tokio::spawn(stream_message_updates(editor.clone(), rx));
-        let stream_tx = tx.clone();
-        let cancelled_jobs = self.cancelled_jobs.clone();
-        let reply = self
-            .handlers
-            .handle_text_stream(chat_id, text, move |delta| {
-                if cancelled_jobs
-                    .lock()
-                    .is_ok_and(|cancelled| cancelled.contains(&job_id))
-                {
-                    return Err(anyhow!("cancelled"));
-                }
-                let _ = stream_tx.send(delta.to_string());
-                Ok(())
-            })
-            .await
-            .unwrap_or_else(|err| format!("处理失败：{err}"));
-        drop(tx);
+        eprintln!(
+            "Telegram placeholder sent: chat {chat_id} message {}",
+            placeholder.message_id
+        );
+        let reply = self.handle_text_blocking(chat_id, text.to_string()).await?;
+        eprintln!(
+            "Telegram handler completed: chat {chat_id} reply_chars={}",
+            reply.chars().count()
+        );
 
-        let edit_state = match edit_task.await {
-            Ok(state) => state,
-            Err(err) => {
-                eprintln!("Telegram stream edit task failed: {err}");
-                StreamEditState::default()
-            }
-        };
         if self.is_job_cancelled(job_id) {
             return Ok(());
         }
-        let final_text = telegram_message_text(&reply);
-        if final_text != edit_state.last_sent {
-            if let Err(err) = editor.edit(&final_text).await {
-                eprintln!("Telegram final edit failed, sending a new message instead: {err}");
-                self.send_long_message(chat_id, &reply).await?;
-            }
-        } else {
-            let pages = telegram_message_pages(&reply);
-            for page in pages.into_iter().skip(1) {
-                if self.is_job_cancelled(job_id) {
-                    break;
-                }
-                self.send_message(chat_id, &page).await?;
-            }
-        }
+        self.send_long_message(chat_id, &reply).await?;
+        eprintln!("Telegram final reply sent: chat {chat_id}");
         Ok(())
+    }
+
+    async fn handle_text_blocking(&self, chat_id: i64, text: String) -> Result<String> {
+        let handlers = self.handlers.clone();
+        tokio::task::spawn_blocking(move || handlers.handle_text(chat_id, &text))
+            .await
+            .map_err(|err| anyhow!("Telegram blocking handler failed: {err}"))
+            .map(|reply| reply.unwrap_or_else(|err| format!("处理失败：{err}")))
     }
 
     fn mark_job_cancelled(&self, job_id: u64) {
@@ -383,34 +351,6 @@ fn http_client(proxy: Option<&str>) -> Result<Client> {
     Ok(builder.build()?)
 }
 
-#[derive(Clone)]
-struct TelegramMessageEditor {
-    token: String,
-    http: Client,
-    chat_id: i64,
-    message_id: i64,
-}
-
-impl TelegramMessageEditor {
-    async fn edit(&self, text: &str) -> Result<()> {
-        let request = || {
-            self.http
-                .post(format!(
-                    "https://api.telegram.org/bot{}/editMessageText",
-                    self.token
-                ))
-                .form(&[
-                    ("chat_id", self.chat_id.to_string()),
-                    ("message_id", self.message_id.to_string()),
-                    ("text", telegram_message_text(text)),
-                    ("disable_web_page_preview", "true".to_string()),
-                ])
-        };
-        send_with_telegram_backoff(request).await?;
-        Ok(())
-    }
-}
-
 async fn send_with_telegram_backoff<F>(request: F) -> Result<reqwest::Response>
 where
     F: Fn() -> reqwest::RequestBuilder,
@@ -422,55 +362,6 @@ where
         return Ok(request().send().await?.error_for_status()?);
     }
     Ok(response.error_for_status()?)
-}
-
-#[derive(Default)]
-struct StreamEditState {
-    buffer: String,
-    last_sent: String,
-}
-
-impl StreamEditState {
-    fn new() -> Self {
-        Self {
-            buffer: String::new(),
-            last_sent: TELEGRAM_STREAM_PLACEHOLDER.to_string(),
-        }
-    }
-}
-
-async fn stream_message_updates(
-    editor: TelegramMessageEditor,
-    mut rx: UnboundedReceiver<String>,
-) -> StreamEditState {
-    let mut state = StreamEditState::new();
-    let mut next_edit_at = Instant::now();
-    while let Some(delta) = rx.recv().await {
-        state.buffer.push_str(&delta);
-        if Instant::now() < next_edit_at {
-            continue;
-        }
-
-        let text = telegram_message_text(&state.buffer);
-        if text != state.last_sent {
-            if let Err(err) = editor.edit(&text).await {
-                eprintln!("Telegram stream edit failed: {err}");
-            } else {
-                state.last_sent = text;
-            }
-        }
-        next_edit_at = Instant::now() + Duration::from_millis(TELEGRAM_STREAM_EDIT_INTERVAL_MS);
-    }
-
-    let text = telegram_message_text(&state.buffer);
-    if !text.is_empty() && text != state.last_sent {
-        if let Err(err) = editor.edit(&text).await {
-            eprintln!("Telegram stream edit failed: {err}");
-        } else {
-            state.last_sent = text;
-        }
-    }
-    state
 }
 
 fn should_stream_text(text: &str) -> bool {
