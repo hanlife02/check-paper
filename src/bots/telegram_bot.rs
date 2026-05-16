@@ -8,7 +8,7 @@ use reqwest::{Client, ClientBuilder, Proxy};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 use super::dispatcher::{ChatDispatcher, DispatchAction};
 use super::handlers::BotHandlers;
@@ -21,6 +21,8 @@ const TELEGRAM_MAX_MESSAGE_CHARS: usize = 3900;
 const TELEGRAM_STREAM_PLACEHOLDER: &str = "处理中...";
 const TELEGRAM_DEFAULT_429_BACKOFF_SECS: u64 = 3;
 const TELEGRAM_LLM_CONCURRENCY: usize = 2;
+const TELEGRAM_STREAM_EDIT_INTERVAL_MS: u64 = 1200;
+const TELEGRAM_STREAM_MIN_EDIT_CHARS: usize = 24;
 
 #[derive(Clone)]
 pub struct TelegramBot {
@@ -229,7 +231,23 @@ impl TelegramBot {
             "Telegram placeholder sent: chat {chat_id} message {}",
             placeholder.message_id
         );
-        let reply = self.handle_text_blocking(chat_id, text.to_string()).await?;
+        let (delta_tx, delta_rx) = unbounded_channel::<String>();
+        let preview_bot = self.clone();
+        let preview_message_id = placeholder.message_id;
+        let preview_task = tokio::task::spawn_local(async move {
+            preview_bot
+                .stream_preview_updates(chat_id, preview_message_id, delta_rx)
+                .await;
+        });
+        let reply = self
+            .handle_text_streaming(chat_id, text.to_string(), move |delta| {
+                let _ = delta_tx.send(delta.to_string());
+                Ok(())
+            })
+            .await?;
+        if let Err(err) = preview_task.await {
+            eprintln!("Telegram stream preview task failed: {err}");
+        }
         eprintln!(
             "Telegram handler completed: chat {chat_id} reply_chars={}",
             reply.chars().count()
@@ -238,9 +256,49 @@ impl TelegramBot {
         if self.is_job_cancelled(job_id) {
             return Ok(());
         }
-        self.send_long_message(chat_id, &reply).await?;
+        self.replace_message_with_long_text(chat_id, placeholder.message_id, &reply)
+            .await?;
         eprintln!("Telegram final reply sent: chat {chat_id}");
         Ok(())
+    }
+
+    async fn stream_preview_updates(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        mut delta_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let mut raw = String::new();
+        let mut last_sent = String::new();
+        let mut last_edit = Instant::now() - Duration::from_secs(60);
+        while let Some(delta) = delta_rx.recv().await {
+            raw.push_str(&delta);
+            let Some(preview) = streaming_answer_preview(&raw) else {
+                continue;
+            };
+            let preview = first_message_page(&format!("{}\n\n...", preview.trim()));
+            if preview.is_empty() || preview == last_sent {
+                continue;
+            }
+            let new_chars = preview
+                .chars()
+                .count()
+                .saturating_sub(last_sent.chars().count());
+            if last_edit.elapsed() < Duration::from_millis(TELEGRAM_STREAM_EDIT_INTERVAL_MS)
+                && new_chars < TELEGRAM_STREAM_MIN_EDIT_CHARS
+            {
+                continue;
+            }
+            match self.edit_message(chat_id, message_id, &preview).await {
+                Ok(_) => {
+                    last_sent = preview;
+                    last_edit = Instant::now();
+                }
+                Err(err) => {
+                    eprintln!("Telegram stream preview edit failed: {err}");
+                }
+            }
+        }
     }
 
     async fn handle_text_blocking(&self, chat_id: i64, text: String) -> Result<String> {
@@ -249,6 +307,22 @@ impl TelegramBot {
             .await
             .map_err(|err| anyhow!("Telegram blocking handler failed: {err}"))
             .map(|reply| reply.unwrap_or_else(|err| format!("处理失败：{err}")))
+    }
+
+    async fn handle_text_streaming<F>(
+        &self,
+        chat_id: i64,
+        text: String,
+        on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        Ok(self
+            .handlers
+            .handle_text_stream(chat_id, &text, on_delta)
+            .await
+            .unwrap_or_else(|err| format!("处理失败：{err}")))
     }
 
     fn mark_job_cancelled(&self, job_id: u64) {
@@ -333,10 +407,50 @@ impl TelegramBot {
         Ok(response.result)
     }
 
+    async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<SentMessage> {
+        let request = || {
+            self.http
+                .post(format!(
+                    "https://api.telegram.org/bot{}/editMessageText",
+                    self.token
+                ))
+                .form(&[
+                    ("chat_id", chat_id.to_string()),
+                    ("message_id", message_id.to_string()),
+                    ("text", telegram_message_text(text)),
+                    ("disable_web_page_preview", "true".to_string()),
+                ])
+        };
+        let response = send_with_telegram_backoff(request).await?;
+        let response: TelegramResponse<SentMessage> = response.json().await?;
+        Ok(response.result)
+    }
+
     async fn send_long_message(&self, chat_id: i64, text: &str) -> Result<()> {
         for page in telegram_message_pages(text) {
             self.send_message(chat_id, &page).await?;
             sleep(Duration::from_millis(1050)).await;
+        }
+        Ok(())
+    }
+
+    async fn replace_message_with_long_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        let pages = telegram_message_pages(text);
+        let Some(first) = pages.first() else {
+            return Ok(());
+        };
+        if let Err(err) = self.edit_message(chat_id, message_id, first).await {
+            eprintln!("Telegram final edit failed, sending a new message instead: {err}");
+            return self.send_long_message(chat_id, text).await;
+        }
+        for page in pages.iter().skip(1) {
+            sleep(Duration::from_millis(1050)).await;
+            self.send_message(chat_id, page).await?;
         }
         Ok(())
     }
@@ -427,6 +541,63 @@ fn first_message_page(text: &str) -> String {
         }
     }
     limited.trim().to_string()
+}
+
+fn streaming_answer_preview(raw: &str) -> Option<String> {
+    partial_json_string_field(raw, "answer").filter(|answer| !answer.trim().is_empty())
+}
+
+fn partial_json_string_field(raw: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let field_start = raw.find(&needle)?;
+    let after_field = &raw[field_start + needle.len()..];
+    let colon = after_field.find(':')?;
+    let after_colon = after_field[colon + 1..].trim_start();
+    let mut chars = after_colon.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    let mut unicode_escape = String::new();
+    let mut reading_unicode = false;
+    for ch in chars {
+        if reading_unicode {
+            unicode_escape.push(ch);
+            if unicode_escape.len() == 4 {
+                if let Ok(codepoint) = u32::from_str_radix(&unicode_escape, 16) {
+                    if let Some(decoded) = char::from_u32(codepoint) {
+                        value.push(decoded);
+                    }
+                }
+                unicode_escape.clear();
+                reading_unicode = false;
+            }
+            continue;
+        }
+        if escaped {
+            match ch {
+                '"' => value.push('"'),
+                '\\' => value.push('\\'),
+                '/' => value.push('/'),
+                'b' => value.push('\u{0008}'),
+                'f' => value.push('\u{000c}'),
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                'u' => reading_unicode = true,
+                other => value.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(value),
+            other => value.push(other),
+        }
+    }
+    Some(value)
 }
 
 fn trim_start_chars(text: &str, count: usize) -> &str {
@@ -594,8 +765,8 @@ fn is_command_boundary(c: char) -> bool {
 mod tests {
     use super::{
         TELEGRAM_MAX_MESSAGE_CHARS, handler_text_after_bot_mention, is_dispatcher_cancel_command,
-        mentions_bot, redact_telegram_token, should_stream_text, strip_bot_mention,
-        telegram_message_pages, telegram_retry_after,
+        mentions_bot, partial_json_string_field, redact_telegram_token, should_stream_text,
+        streaming_answer_preview, strip_bot_mention, telegram_message_pages, telegram_retry_after,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -694,6 +865,26 @@ mod tests {
         assert!(!should_stream_text("/jobs"));
         assert!(!should_stream_text("/cancel"));
         assert!(should_stream_text("/ask 问题"));
+    }
+
+    #[test]
+    fn streaming_preview_extracts_only_answer_field() {
+        let raw = r#"{"answer":"这三篇论文分别研究材料合成、COF 和热调节纤维。","claims":[]}"#;
+
+        assert_eq!(
+            streaming_answer_preview(raw).as_deref(),
+            Some("这三篇论文分别研究材料合成、COF 和热调节纤维。")
+        );
+    }
+
+    #[test]
+    fn streaming_preview_accepts_partial_answer_json() {
+        let raw = r#"{"answer":"正在生成一段还没有闭合的回答"#;
+
+        assert_eq!(
+            partial_json_string_field(raw, "answer").as_deref(),
+            Some("正在生成一段还没有闭合的回答")
+        );
     }
 
     #[test]

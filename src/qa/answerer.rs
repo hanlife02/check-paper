@@ -291,10 +291,15 @@ impl<'a> Answerer<'a> {
             }
         };
         let terms = query_terms(question);
-        Ok((
-            author_profile,
-            rank_profiles(all_profiles, &terms, PROFILE_CONTEXT_LIMIT),
-        ))
+        let profiles = if should_use_source_chunks(question, all_profiles.len()) {
+            rank_profiles(all_profiles, &terms, PROFILE_CONTEXT_LIMIT)
+        } else {
+            all_profiles
+                .into_iter()
+                .take(PROFILE_CONTEXT_LIMIT)
+                .collect()
+        };
+        Ok((author_profile, profiles))
     }
 
     fn context_chunks(
@@ -950,6 +955,78 @@ mod tests {
         let (author_profile, _) = answerer.profile_context("Alice", "MOF").unwrap();
 
         assert!(author_profile.is_none());
+    }
+
+    #[test]
+    fn non_detail_profile_context_keeps_all_profiled_papers() {
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        for (paper_id, title, keyword) in [
+            ("paper-a", "A Paper", "topic-a"),
+            ("paper-b", "B Paper", "topic-b"),
+            ("paper-c", "C Paper", "topic-c"),
+        ] {
+            let paper = Paper {
+                author: "Alice".to_string(),
+                paper_id: paper_id.to_string(),
+                paper_dir: dir.path().to_path_buf(),
+                article_path: dir.path().join(format!("{paper_id}.md")),
+                fetch_result_path: None,
+                source_hash: format!("{paper_id}-source"),
+                metadata: std::collections::BTreeMap::from([
+                    ("title".to_string(), title.to_string()),
+                    ("doi".to_string(), format!("10.1/{paper_id}")),
+                    ("year".to_string(), "2026".to_string()),
+                ]),
+                fetch_result: json!({}),
+                raw_body: String::new(),
+                clean_text: String::new(),
+                sections: vec![crate::papers::models::Section {
+                    title: "Article Text".to_string(),
+                    level: 2,
+                    content: format!("Abstract\nThis paper covers {keyword}."),
+                }],
+            };
+            let chunks = chunk_paper(&paper, 3200, 350);
+            storage.upsert_paper(&paper, &chunks).unwrap();
+            storage
+                .save_paper_profile_with_metadata(
+                    &paper.key(),
+                    &json!({
+                        "paper_key": paper.key(),
+                        "title": title,
+                        "doi": format!("10.1/{paper_id}"),
+                        "year": "2026",
+                        "one_sentence_summary": format!("This paper covers {keyword}."),
+                        "methods": [{"method": keyword, "evidence_chunks": [0]}],
+                        "topic_keywords": [keyword]
+                    }),
+                    PaperProfileMetadata {
+                        source_hash: &paper.source_hash,
+                        schema_version: PAPER_PROFILE_SCHEMA_VERSION,
+                        prompt_version: PAPER_PROFILE_PROMPT_VERSION,
+                        model_id: "test-model",
+                        chunker_version: "section-char-v1",
+                    },
+                )
+                .unwrap();
+        }
+        let answerer = Answerer::new(&storage, test_llm("test-model"));
+
+        let (_, profiles) = answerer
+            .profile_context("Alice", "这三篇文献的题目+时间+简要内容是什么")
+            .unwrap();
+        let (chunks, _) = answerer
+            .context_chunks(
+                "Alice",
+                "这三篇文献的题目+时间+简要内容是什么",
+                &profiles,
+                8,
+            )
+            .unwrap();
+
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(chunks.len(), 3);
     }
 
     #[test]
