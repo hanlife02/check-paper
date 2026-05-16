@@ -29,6 +29,7 @@ use crate::services::classification::{
 };
 use crate::services::embedding::EmbeddingService;
 use crate::services::eval::EvalService;
+use crate::services::extraction::{ExtractionService, V2ExtractionOptions, V2ExtractionReport};
 use crate::services::jobs::JobService;
 use crate::services::profile::{AuthorProfileLookup, AuthorProfileRebuild, ProfileService};
 use crate::services::qa::QaService;
@@ -73,6 +74,8 @@ enum Command {
     Sync(AnalyzeArgs),
     #[command(about = "Classify chunks for the V2 comprehension pipeline")]
     Classify(ClassifyArgs),
+    #[command(about = "Extract V2 chunk facts from classified chunks")]
+    Extract(ExtractArgs),
     #[command(about = "Create or refresh chunk embeddings")]
     Embed(EmbedArgs),
     #[command(about = "Ask a question about an author's papers")]
@@ -244,6 +247,25 @@ struct ClassifyArgs {
     dry_run: bool,
 }
 
+#[derive(Args, Clone)]
+struct ExtractArgs {
+    #[arg(long, help = "Author directory under the paper root")]
+    author: Option<String>,
+    #[arg(long, help = "Run the V2 chunk fact extraction pipeline")]
+    v2: bool,
+    #[arg(long, help = "Maximum number of chunks to scan")]
+    limit: Option<usize>,
+    #[arg(long, help = "Re-extract chunks even when current chunk facts exist")]
+    force: bool,
+    #[arg(
+        long,
+        help = "Only retry chunks recorded as failed in a previous V2 extraction"
+    )]
+    failed_only: bool,
+    #[arg(long, help = "Print the extraction plan without writing the database")]
+    dry_run: bool,
+}
+
 #[derive(Args)]
 struct AskArgs {
     #[arg(long, help = "Author directory under the paper root")]
@@ -361,6 +383,7 @@ pub fn run() -> Result<()> {
                     cmd_analyze(args, &settings)
                 }
                 Command::Classify(args) => cmd_classify(args, &settings),
+                Command::Extract(args) => cmd_extract(args, &settings),
                 Command::Embed(args) => cmd_embed(args, &settings),
                 Command::Ask(args) => cmd_ask(args, &settings),
                 Command::Eval(args) => cmd_eval(args, &settings),
@@ -1182,6 +1205,58 @@ fn format_classification_report(report: &ClassificationReport) -> String {
     lines.join("\n")
 }
 
+fn cmd_extract(args: ExtractArgs, settings: &Settings) -> Result<()> {
+    if !args.v2 {
+        return Err(anyhow!("extract currently requires --v2"));
+    }
+    let author = resolve_author(args.author.as_deref(), settings)?;
+    let storage = Storage::open(&settings.db_path)?;
+    let report = ExtractionService::new(&storage).extract_author_v2(
+        &author,
+        V2ExtractionOptions {
+            limit: args.limit,
+            force: args.force,
+            dry_run: args.dry_run,
+            failed_only: args.failed_only,
+        },
+    )?;
+    println!("{}", format_v2_extraction_report(&report));
+    Ok(())
+}
+
+fn format_v2_extraction_report(report: &V2ExtractionReport) -> String {
+    let mut lines = Vec::new();
+    let mode = if report.dry_run {
+        "v2 chunk fact extraction dry run:"
+    } else {
+        "v2 chunk fact extraction:"
+    };
+    lines.push(mode.to_string());
+    lines.push(format!("failed_only: {}", report.failed_only));
+    lines.push(format!("chunks_scanned: {}", report.chunks_scanned));
+    lines.push(format!("extracted: {}", report.extracted));
+    lines.push(format!("changed: {}", report.changed));
+    lines.push(format!("skipped_current: {}", report.skipped_current));
+    lines.push(format!(
+        "skipped_by_classification: {}",
+        report.skipped_by_classification
+    ));
+    lines.push(format!(
+        "missing_current_classification: {}",
+        report.missing_current_classification
+    ));
+    lines.push(format!("failed: {}", report.failed));
+    lines.push("by fact type:".to_string());
+    if report.by_fact_type.is_empty() {
+        lines.push("- <none>: 0".to_string());
+    } else {
+        for (fact_type, count) in &report.by_fact_type {
+            lines.push(format!("- {fact_type}: {count}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn cmd_embed(args: EmbedArgs, settings: &Settings) -> Result<()> {
     let author = resolve_author(args.author.as_deref(), settings)?;
     require_embedding(settings)?;
@@ -1759,13 +1834,15 @@ mod tests {
         AnalysisFailure, AskArgs, PaperRootAuthorSummary, TelegramBotStatus,
         analysis_failure_summary_lines, backup_database, classify_analysis_error, cmd_ask,
         embed_batch_with_retries, format_author_inventory, format_classification_report,
-        format_cli_chat_ids, format_preflight_report, format_tg_status, missing_author_message,
-        paper_root_authors, redact_secret, resolve_author, should_rebuild_author_profile,
+        format_cli_chat_ids, format_preflight_report, format_tg_status,
+        format_v2_extraction_report, missing_author_message, paper_root_authors, redact_secret,
+        resolve_author, should_rebuild_author_profile,
     };
     use crate::config::Settings;
     use crate::papers::models::Paper;
     use crate::retrieval::embedding::EmbeddingProvider;
     use crate::services::classification::ClassificationReport;
+    use crate::services::extraction::V2ExtractionReport;
     use crate::storage::Storage;
     use crate::storage::{AuthorSummary, LibraryStatus};
     use indicatif::ProgressBar;
@@ -1979,6 +2056,31 @@ mod tests {
         assert!(text.contains("classified: 3"));
         assert!(text.contains("- methods: 1"));
         assert!(text.contains("- reference_section: 1"));
+    }
+
+    #[test]
+    fn formats_v2_extraction_report_with_fact_counts() {
+        let report = V2ExtractionReport {
+            chunks_scanned: 5,
+            extracted: 3,
+            changed: 2,
+            skipped_current: 1,
+            skipped_by_classification: 1,
+            missing_current_classification: 0,
+            failed: 0,
+            by_fact_type: BTreeMap::from([("method".to_string(), 1), ("result".to_string(), 2)]),
+            dry_run: true,
+            failed_only: true,
+        };
+
+        let text = format_v2_extraction_report(&report);
+
+        assert!(text.contains("v2 chunk fact extraction dry run"));
+        assert!(text.contains("failed_only: true"));
+        assert!(text.contains("chunks_scanned: 5"));
+        assert!(text.contains("extracted: 3"));
+        assert!(text.contains("skipped_by_classification: 1"));
+        assert!(text.contains("- result: 2"));
     }
 
     #[test]

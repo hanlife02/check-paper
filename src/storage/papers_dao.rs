@@ -125,6 +125,24 @@ impl Storage {
                 params![paper.key()],
             )?;
             tx.execute(
+                r#"
+                DELETE FROM chunk_facts
+                WHERE chunk_id IN (
+                    SELECT id FROM chunks WHERE paper_key = ?
+                )
+                "#,
+                params![paper.key()],
+            )?;
+            tx.execute(
+                r#"
+                DELETE FROM chunk_fact_failures
+                WHERE chunk_id IN (
+                    SELECT id FROM chunks WHERE paper_key = ?
+                )
+                "#,
+                params![paper.key()],
+            )?;
+            tx.execute(
                 "DELETE FROM chunks WHERE paper_key = ?",
                 params![paper.key()],
             )?;

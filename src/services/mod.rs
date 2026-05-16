@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod classification;
 pub mod embedding;
 pub mod eval;
+pub mod extraction;
 pub mod jobs;
 pub mod profile;
 pub mod qa;

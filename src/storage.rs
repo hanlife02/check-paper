@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 mod chunk_classifications_dao;
+mod chunk_facts_dao;
 mod chunks_dao;
 mod embeddings_dao;
 mod facts_dao;
@@ -65,6 +66,36 @@ pub struct NewChunkClassification<'a> {
     pub usefulness_score: f64,
     pub skip_reason: Option<&'a str>,
     pub classifier_version: &'a str,
+    pub source_hash: &'a str,
+    pub chunk_hash: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkFact {
+    pub chunk_fact_id: i64,
+    pub claim_uid: String,
+    pub paper_key: String,
+    pub chunk_id: i64,
+    pub fact_type: String,
+    pub fact_json: String,
+    pub confidence: Option<String>,
+    pub extractor: String,
+    pub extractor_version: String,
+    pub source_hash: String,
+    pub chunk_hash: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewChunkFact<'a> {
+    pub claim_uid: &'a str,
+    pub paper_key: &'a str,
+    pub chunk_id: i64,
+    pub fact_type: &'a str,
+    pub fact_json: &'a str,
+    pub confidence: Option<&'a str>,
+    pub extractor: &'a str,
+    pub extractor_version: &'a str,
     pub source_hash: &'a str,
     pub chunk_hash: &'a str,
 }
@@ -447,7 +478,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 5);
     }
 
     #[test]

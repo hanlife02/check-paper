@@ -126,6 +126,8 @@ impl Storage {
         self.apply_metadata_migrations()?;
         self.apply_embedding_contract_migration()?;
         self.apply_chunk_classification_migration()?;
+        self.apply_chunk_fact_migration()?;
+        self.apply_chunk_fact_failure_migration()?;
         Ok(())
     }
 
@@ -308,6 +310,116 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_chunk_classifications_kind
                 ON chunk_classifications(chunk_kind);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_chunk_fact_migration(&self) -> Result<()> {
+        self.apply_migration(
+            4,
+            "chunk_facts",
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_facts (
+                chunk_fact_id INTEGER PRIMARY KEY,
+                claim_uid TEXT NOT NULL UNIQUE,
+                paper_key TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                fact_type TEXT NOT NULL,
+                fact_json TEXT NOT NULL,
+                confidence TEXT,
+                extractor TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_facts_paper_key
+                ON chunk_facts(paper_key);
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_facts_chunk_id
+                ON chunk_facts(chunk_id);
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_facts_fact_type
+                ON chunk_facts(fact_type);
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_facts (
+                chunk_fact_id INTEGER PRIMARY KEY,
+                claim_uid TEXT NOT NULL UNIQUE,
+                paper_key TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                fact_type TEXT NOT NULL,
+                fact_json TEXT NOT NULL,
+                confidence TEXT,
+                extractor TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_facts_paper_key
+                ON chunk_facts(paper_key);
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_facts_chunk_id
+                ON chunk_facts(chunk_id);
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_facts_fact_type
+                ON chunk_facts(fact_type);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_chunk_fact_failure_migration(&self) -> Result<()> {
+        self.apply_migration(
+            5,
+            "chunk_fact_failures",
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_fact_failures (
+                id INTEGER PRIMARY KEY,
+                paper_key TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                extractor TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                error TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chunk_id, extractor, extractor_version),
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_fact_failures_paper_key
+                ON chunk_fact_failures(paper_key);
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_fact_failures (
+                id INTEGER PRIMARY KEY,
+                paper_key TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                extractor TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                error TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chunk_id, extractor, extractor_version),
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_fact_failures_paper_key
+                ON chunk_fact_failures(paper_key);
             "#,
         )?;
         Ok(())

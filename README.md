@@ -82,6 +82,7 @@ ppc scan --author "Ruqiang ZOU"
 ppc ingest --author "Ruqiang ZOU"
 ppc analyze --author "Ruqiang ZOU" --limit 5
 ppc classify --author "Ruqiang ZOU"
+ppc extract --author "Ruqiang ZOU" --v2
 ppc embed --author "Ruqiang ZOU"
 ppc ask --author "Ruqiang ZOU" "这个人的主要研究贡献是什么？"
 ppc backup
@@ -106,9 +107,15 @@ V2 理解层的第一步是 chunk 分类，不会改变当前问答默认行为�
 ppc classify --author "Ruqiang ZOU"
 ppc classify --author "Ruqiang ZOU" --dry-run
 ppc classify --author "Ruqiang ZOU" --force
+ppc extract --author "Ruqiang ZOU" --v2
+ppc extract --author "Ruqiang ZOU" --v2 --dry-run
+ppc extract --author "Ruqiang ZOU" --v2 --force
+ppc extract --author "Ruqiang ZOU" --v2 --failed-only
 ```
 
 `classify` 会为已入库 chunks 写入确定性分类结果，包括 `chunk_kind`、`usefulness_score`、`skip_reason`、`classifier_version`、`source_hash` 和 `chunk_hash`。这些结果供后续 V2 chunk-level fact extraction 使用；当前 `ask` 和 Telegram 仍沿用现有检索问答链路。
+
+`extract --v2` 会消费 current chunk classification，为 meaningful chunks 写入确定性 `chunk_facts`，包括 `claim_uid`、`fact_type`、`fact_json`、`confidence`、`extractor_version`、`source_hash` 和 `chunk_hash`。如果提示 `missing_current_classification` 大于 0，先运行 `ppc classify --author "Ruqiang ZOU"`；如果有失败记录，`--failed-only` 只重试这些 chunks。S2 仍不调用 LLM，也不会改变当前 `ask` 和 Telegram 默认行为。
 
 分析和维护常用参数：
 
@@ -196,6 +203,7 @@ data/check_paper.sqlite
 - FTS 检索索引
 - chunk embedding 和 embedding 版本信息
 - 每篇论文的 LLM 理解 JSON
+- V2 chunk classification 和 chunk facts
 - 作者级聚合画像 JSON
 - 分析任务队列、任务状态历史和失败原因
 - QA 日志、引用快照、token 用量和估算成本
