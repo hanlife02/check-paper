@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::qa::planner::should_use_source_chunks;
-use crate::qa::renderer::render_qa_answer;
+use crate::qa::renderer::render_qa_answer_for_question;
 use crate::qa::verifier::{parse_qa_answer, verify_qa_answer};
 use crate::retrieval::embedding::OpenAiCompatibleEmbeddingClient;
 use crate::retrieval::profile_route::rank_profiles;
@@ -117,7 +117,7 @@ impl<'a> Answerer<'a> {
                 },
                 &repaired,
             )?;
-            return Ok(render_qa_answer(&repaired));
+            return Ok(render_qa_answer_for_question(&repaired, question));
         }
         let repaired = match self.valid_or_repaired_answer(&first.content, &chunks) {
             Ok(answer) => answer,
@@ -154,7 +154,7 @@ impl<'a> Answerer<'a> {
             },
             &repaired,
         )?;
-        Ok(render_qa_answer(&repaired))
+        Ok(render_qa_answer_for_question(&repaired, question))
     }
 
     pub async fn answer_stream<F>(
@@ -228,7 +228,7 @@ impl<'a> Answerer<'a> {
                 },
                 &repaired,
             )?;
-            return Ok(render_qa_answer(&repaired));
+            return Ok(render_qa_answer_for_question(&repaired, question));
         }
         let repaired = match self.valid_or_repaired_answer(&first, &chunks) {
             Ok(answer) => answer,
@@ -265,7 +265,7 @@ impl<'a> Answerer<'a> {
             },
             &repaired,
         )?;
-        Ok(render_qa_answer(&repaired))
+        Ok(render_qa_answer_for_question(&repaired, question))
     }
 
     fn profile_context(

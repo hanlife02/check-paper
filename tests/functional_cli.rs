@@ -73,7 +73,11 @@ The best condition reports 91% conversion under mild conditions.
             "请用一句话概括目前已分析论文的主要方向",
         ],
     );
-    assert_success(ask);
+    assert_success_ref(&ask);
+    let ask_stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(ask_stdout.contains("已分析论文主要围绕可规模化催化剂合成。"));
+    assert!(!ask_stdout.contains("依据："));
+    assert!(!ask_stdout.contains("不确定性："));
 
     let requests = collect_requests(&request_rx, 3);
     let qa_prompt = requests
@@ -111,6 +115,10 @@ fn run_ppc(config_path: &Path, args: &[&str]) -> Output {
 }
 
 fn assert_success(output: Output) {
+    assert_success_ref(&output);
+}
+
+fn assert_success_ref(output: &Output) {
     if !output.status.success() {
         panic!(
             "command failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
