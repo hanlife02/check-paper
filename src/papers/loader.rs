@@ -139,7 +139,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{source_hash_with_versions, validate_fetch_result};
+    use super::{load_paper, source_hash_with_versions, validate_fetch_result};
 
     #[test]
     fn validates_fetch_result_shape() {
@@ -162,5 +162,62 @@ mod tests {
 
         assert_ne!(base, parser_changed);
         assert_ne!(base, cleaner_changed);
+    }
+
+    #[test]
+    fn load_paper_builds_canonical_paper_from_article_directory() {
+        let dir = tempdir().unwrap();
+        let paper_root = dir.path().join("paper");
+        let paper_dir = paper_root.join("Alice").join("paper-a");
+        std::fs::create_dir_all(&paper_dir).unwrap();
+        std::fs::write(
+            paper_dir.join("article.md"),
+            r#"---
+title: "Frontmatter Title"
+doi: "10.1/front"
+year: "2024"
+---
+# Abstract
+This paper studies MOF catalysis.
+
+## Methods
+The method uses solvent screening.
+
+Figure 1. Conversion trend."#,
+        )
+        .unwrap();
+        std::fs::write(
+            paper_dir.join("fetch-result.json"),
+            r#"{"title":"Fetched Title","source":"test-source"}"#,
+        )
+        .unwrap();
+
+        let paper = load_paper(&paper_root, &paper_dir).unwrap();
+
+        assert_eq!(paper.author, "Alice");
+        assert_eq!(paper.paper_id, "paper-a");
+        assert_eq!(paper.title(), "Frontmatter Title");
+        assert_eq!(paper.doi(), "10.1/front");
+        assert_eq!(paper.year(), "2024");
+        assert_eq!(paper.source(), "test-source");
+        assert!(paper.fetch_result_path.is_some());
+        assert!(
+            paper
+                .clean_text
+                .contains("This paper studies MOF catalysis.")
+        );
+        assert!(
+            paper
+                .sections
+                .iter()
+                .any(|section| section.title == "Abstract")
+        );
+        assert!(
+            paper
+                .sections
+                .iter()
+                .any(|section| section.title == "Figure 1 Caption")
+        );
+        assert!(!paper.source_hash.trim().is_empty());
     }
 }

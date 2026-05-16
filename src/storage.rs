@@ -254,7 +254,9 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    use crate::papers::loader::load_paper;
     use crate::papers::models::{Paper, Section};
+    use crate::papers::scanner::scan_paper_dirs;
     use crate::retrieval::chunker::chunk_paper;
     use crate::retrieval::fusion::rrf_merge_chunks;
     use crate::retrieval::query::query_terms;
@@ -336,6 +338,42 @@ mod tests {
         assert_eq!(authors[0].paper_count, 2);
         assert_eq!(authors[1].author, "Bob");
         assert_eq!(authors[1].paper_count, 1);
+    }
+
+    #[test]
+    fn ingest_pipeline_scans_loads_chunks_and_upserts_paper() {
+        let dir = tempdir().unwrap();
+        let paper_root = dir.path().join("paper");
+        let paper_dir = paper_root.join("Alice").join("paper-a");
+        std::fs::create_dir_all(&paper_dir).unwrap();
+        std::fs::write(
+            paper_dir.join("article.md"),
+            r#"---
+title: "Pipeline Paper"
+doi: "10.1/pipeline"
+year: "2024"
+---
+# Abstract
+This pipeline paper studies MOF catalysis.
+
+## Results
+The reported conversion is 82%."#,
+        )
+        .unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+
+        let paper_dirs = scan_paper_dirs(&paper_root, Some("Alice")).unwrap();
+        let paper = load_paper(&paper_root, &paper_dirs[0]).unwrap();
+        let chunks = chunk_paper(&paper, 3200, 350);
+        let changed = storage.upsert_paper(&paper, &chunks).unwrap();
+
+        assert!(changed);
+        assert_eq!(storage.authors().unwrap()[0].author, "Alice");
+        let stored_chunks = storage.all_chunks_for_author("Alice", None).unwrap();
+        assert_eq!(stored_chunks.len(), 2);
+        assert_eq!(stored_chunks[0].title, "Pipeline Paper");
+        assert!(stored_chunks[0].text.contains("MOF catalysis"));
+        assert!(stored_chunks[1].text.contains("82%"));
     }
 
     #[test]

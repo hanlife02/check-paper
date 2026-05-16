@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::qa::planner::should_use_source_chunks;
 use crate::qa::renderer::render_qa_answer;
 use crate::qa::verifier::{parse_qa_answer, verify_qa_answer};
 use crate::retrieval::embedding::OpenAiCompatibleEmbeddingClient;
@@ -303,15 +304,30 @@ impl<'a> Answerer<'a> {
         profiles: &[serde_json::Value],
         limit: usize,
     ) -> Result<(Vec<crate::storage::SourceChunk>, serde_json::Value)> {
+        if !should_use_source_chunks(question, profiles.len()) {
+            let chunks = self.profile_grounding_chunks(profiles, limit)?;
+            if !chunks.is_empty() {
+                let trace = json!({
+                    "routes": {
+                        "profile_grounding": chunks.iter().enumerate().map(|(rank, chunk)| json!({
+                            "rank": rank + 1,
+                            "chunk_id": chunk.id,
+                            "paper_key": chunk.paper_key,
+                            "chunk_index": chunk.chunk_index,
+                            "section": chunk.section,
+                            "section_kind": chunk.section_kind,
+                            "caption_label": chunk.caption_label,
+                        })).collect::<Vec<_>>()
+                    },
+                    "fusion": []
+                });
+                return Ok((chunks, trace));
+            }
+        }
         let (mut chunks, mut trace) = self.search_chunks(author, question, limit)?;
         if chunks.len() < limit {
-            let paper_keys = profiles
-                .iter()
-                .filter_map(|profile| profile.get("paper_key").and_then(serde_json::Value::as_str))
-                .map(str::to_string)
-                .collect::<Vec<_>>();
             let remaining = limit - chunks.len();
-            let profile_chunks = self.storage.chunks_for_paper_keys(&paper_keys, remaining)?;
+            let profile_chunks = self.profile_grounding_chunks(profiles, remaining)?;
             if let Some(object) = trace.as_object_mut() {
                 object.insert(
                     "profile_fill_count".to_string(),
@@ -336,6 +352,19 @@ impl<'a> Answerer<'a> {
             });
         }
         Ok((chunks, trace))
+    }
+
+    fn profile_grounding_chunks(
+        &self,
+        profiles: &[serde_json::Value],
+        limit: usize,
+    ) -> Result<Vec<crate::storage::SourceChunk>> {
+        let paper_keys = profiles
+            .iter()
+            .filter_map(|profile| profile.get("paper_key").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        self.storage.chunks_for_paper_keys(&paper_keys, limit)
     }
 
     fn search_chunks(
@@ -636,6 +665,11 @@ fn text_excerpt(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -918,10 +952,191 @@ mod tests {
         assert!(author_profile.is_none());
     }
 
+    #[test]
+    fn broad_profile_question_grounds_in_article_body_not_metadata() {
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        let paper = Paper {
+            author: "Alice".to_string(),
+            paper_id: "paper-a".to_string(),
+            paper_dir: dir.path().to_path_buf(),
+            article_path: dir.path().join("article.md"),
+            fetch_result_path: None,
+            source_hash: "source-a".to_string(),
+            metadata: std::collections::BTreeMap::from([
+                ("title".to_string(), "MOF Paper".to_string()),
+                ("doi".to_string(), "10.1/test".to_string()),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            fetch_result: json!({}),
+            raw_body: String::new(),
+            clean_text: String::new(),
+            sections: vec![
+                crate::papers::models::Section {
+                    title: "MOF Paper".to_string(),
+                    level: 1,
+                    content: "- DOI: `10.1/test`\n- Year: `2024`".to_string(),
+                },
+                crate::papers::models::Section {
+                    title: "Article Text".to_string(),
+                    level: 2,
+                    content: "Abstract\nDeveloping scalable methods for MOF catalysis is the central topic."
+                        .to_string(),
+                },
+            ],
+        };
+        let chunks = chunk_paper(&paper, 3200, 350);
+        storage.upsert_paper(&paper, &chunks).unwrap();
+        storage
+            .save_paper_profile_with_metadata(
+                &paper.key(),
+                &json!({
+                    "paper_key": paper.key(),
+                    "title": "MOF Paper",
+                    "doi": "10.1/test",
+                    "year": "2024",
+                    "one_sentence_summary": "This paper studies MOF catalysis.",
+                    "methods": [{"method": "scalable methods", "evidence_chunks": [1]}],
+                    "topic_keywords": ["MOF catalysis"]
+                }),
+                PaperProfileMetadata {
+                    source_hash: &paper.source_hash,
+                    schema_version: PAPER_PROFILE_SCHEMA_VERSION,
+                    prompt_version: PAPER_PROFILE_PROMPT_VERSION,
+                    model_id: "test-model",
+                    chunker_version: "section-char-v1",
+                },
+            )
+            .unwrap();
+        let profiles = storage.paper_profiles("Alice", None).unwrap();
+        let answerer = Answerer::new(&storage, test_llm("test-model"));
+
+        let (chunks, trace) = answerer
+            .context_chunks(
+                "Alice",
+                "请用一句话概括目前已分析论文的主要方向",
+                &profiles,
+                8,
+            )
+            .unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_index, 1);
+        assert_eq!(chunks[0].section, "Article Text");
+        assert!(chunks[0].text.contains("Developing scalable methods"));
+        assert!(!chunks[0].text.contains("DOI:"));
+        assert_eq!(trace["routes"]["profile_grounding"][0]["chunk_index"], 1);
+    }
+
+    #[test]
+    fn answer_flow_uses_current_author_profile_and_logs_grounded_sources() {
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        let paper = Paper {
+            author: "Alice".to_string(),
+            paper_id: "paper-a".to_string(),
+            paper_dir: dir.path().to_path_buf(),
+            article_path: dir.path().join("article.md"),
+            fetch_result_path: None,
+            source_hash: "source-a".to_string(),
+            metadata: std::collections::BTreeMap::from([
+                ("title".to_string(), "MOF Paper".to_string()),
+                ("doi".to_string(), "10.1/test".to_string()),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            fetch_result: json!({}),
+            raw_body: String::new(),
+            clean_text: String::new(),
+            sections: vec![crate::papers::models::Section {
+                title: "Abstract".to_string(),
+                level: 1,
+                content: "This paper studies MOF catalysis with solvent screening.".to_string(),
+            }],
+        };
+        let chunks = chunk_paper(&paper, 3200, 350);
+        storage.upsert_paper(&paper, &chunks).unwrap();
+        let source_chunk = storage.all_chunks_for_author("Alice", Some(1)).unwrap()[0].clone();
+        storage
+            .save_paper_profile_with_metadata(
+                &paper.key(),
+                &json!({
+                    "paper_key": paper.key(),
+                    "title": "MOF Paper",
+                    "doi": "10.1/test",
+                    "year": "2024",
+                    "one_sentence_summary": "This paper studies MOF catalysis.",
+                    "methods": [{"method": "solvent screening", "evidence_chunks": [0]}],
+                    "topic_keywords": ["MOF", "catalysis"]
+                }),
+                PaperProfileMetadata {
+                    source_hash: &paper.source_hash,
+                    schema_version: PAPER_PROFILE_SCHEMA_VERSION,
+                    prompt_version: PAPER_PROFILE_PROMPT_VERSION,
+                    model_id: "test-model",
+                    chunker_version: "section-char-v1",
+                },
+            )
+            .unwrap();
+        let profiles = storage.paper_profiles("Alice", None).unwrap();
+        let source_profile_hash = profile_source_hash(&profiles).unwrap();
+        storage
+            .save_author_profile_with_metadata(
+                "Alice",
+                &json!({"author": "Alice", "answer_scope": ["MOF catalysis"]}),
+                AUTHOR_PROFILE_SCHEMA_VERSION,
+                AUTHOR_PROFILE_PROMPT_VERSION,
+                "test-model",
+                &source_profile_hash,
+            )
+            .unwrap();
+        let raw_answer = json!({
+            "answer": "这篇论文研究 MOF catalysis。",
+            "claims": [{
+                "claim": "这篇论文研究 MOF catalysis。",
+                "evidence_indices": [0],
+                "support": "strong"
+            }],
+            "evidence": [{
+                "paper_key": "Alice/paper-a",
+                "title": "MOF Paper",
+                "doi": "10.1/test",
+                "year": "2024",
+                "chunk_id": source_chunk.id,
+                "section": "Abstract",
+                "quote_or_summary": "MOF catalysis"
+            }],
+            "uncertainty": "",
+            "followup_queries": []
+        })
+        .to_string();
+        let (base_url, request_rx, handle) = start_chat_completion_server(raw_answer);
+        let answerer = Answerer::new(&storage, test_llm_at("test-model", &base_url));
+
+        let rendered = answerer
+            .answer("Alice", "What does the MOF catalysis paper study?")
+            .unwrap();
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock LLM should receive one request");
+
+        assert!(request.contains("author_profile"));
+        assert!(request.contains("source_chunks"));
+        assert!(request.contains("MOF catalysis"));
+        assert!(rendered.contains("这篇论文研究 MOF catalysis。"));
+        let logged = storage.latest_qa_answer(Some("Alice")).unwrap().unwrap();
+        assert_eq!(logged["evidence_snapshot"][0]["chunk_id"], source_chunk.id);
+        assert_eq!(logged["evidence_snapshot"][0]["section"], "Abstract");
+        handle.join().unwrap();
+    }
+
     fn test_llm(model: &str) -> OpenAiCompatibleClient {
+        test_llm_at(model, "http://127.0.0.1:9/v1")
+    }
+
+    fn test_llm_at(model: &str, base_url: &str) -> OpenAiCompatibleClient {
         OpenAiCompatibleClient::new(LlmConfig {
-            base_url: "http://127.0.0.1:9/v1".to_string(),
-            api_key: None,
+            base_url: base_url.to_string(),
+            api_key: Some("test-key".to_string()),
             model: model.to_string(),
             proxy: None,
             timeout_secs: 1,
@@ -930,5 +1145,65 @@ mod tests {
             completion_cost_per_1k: None,
         })
         .unwrap()
+    }
+
+    fn start_chat_completion_server(
+        answer: String,
+    ) -> (String, std::sync::mpsc::Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            tx.send(request).unwrap();
+            let body = json!({
+                "choices": [{"message": {"content": answer}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}/v1"), rx, handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request_body_complete(&request) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    fn request_body_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
     }
 }
