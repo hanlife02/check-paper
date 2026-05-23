@@ -9,7 +9,7 @@ pub(crate) fn search_like_route(
     terms: &[String],
     limit: usize,
 ) -> Result<Vec<SourceChunk>> {
-    let chunks = storage.all_chunks_for_author(author, None)?;
+    let chunks = storage.like_route_candidates(author)?;
     Ok(rank_like_chunks(chunks, terms, limit))
 }
 
@@ -61,6 +61,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         }
     }
 

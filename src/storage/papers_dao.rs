@@ -143,6 +143,10 @@ impl Storage {
                 params![paper.key()],
             )?;
             tx.execute(
+                "DELETE FROM paper_profiles_v2 WHERE paper_key = ?",
+                params![paper.key()],
+            )?;
+            tx.execute(
                 "DELETE FROM chunks WHERE paper_key = ?",
                 params![paper.key()],
             )?;
@@ -156,9 +160,12 @@ impl Storage {
                     INSERT INTO chunks (
                         paper_key, chunk_index, section, text, chunk_hash,
                         chunker_version, max_chars, overlap, source_hash, section_path,
-                        section_kind, caption_label
+                        section_kind, caption_label, caption_object_type, caption_object_label,
+                        caption_panel_labels_json, caption_target_labels_json,
+                        caption_panel_details_json,
+                        caption_measurements_json, caption_conditions_json, caption_values_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#,
                     params![
                         chunk.paper_key,
@@ -172,7 +179,15 @@ impl Storage {
                         paper.source_hash,
                         chunk.section,
                         chunk.section_kind,
-                        chunk.caption_label
+                        chunk.caption_label,
+                        chunk.caption_object_type,
+                        chunk.caption_object_label,
+                        chunk.caption_panel_labels_json,
+                        chunk.caption_target_labels_json,
+                        chunk.caption_panel_details_json,
+                        chunk.caption_measurements_json,
+                        chunk.caption_conditions_json,
+                        chunk.caption_values_json
                     ],
                 )?;
                 let chunk_id = tx.last_insert_rowid();

@@ -2,9 +2,10 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-use crate::retrieval::fact_route::FactRouteCandidate;
-
-use super::{Storage, source_chunk_from_row};
+use super::{
+    FactRouteCandidate, SOURCE_CHUNK_COLUMN_COUNT, SOURCE_CHUNK_SELECT_COLUMNS, Storage,
+    source_chunk_from_row,
+};
 
 impl Storage {
     pub fn save_paper_facts(&self, paper_key: &str, facts: &[Value]) -> Result<()> {
@@ -131,27 +132,26 @@ impl Storage {
     }
 
     pub(crate) fn fact_route_candidates(&self, author: &str) -> Result<Vec<FactRouteCandidate>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.paper_key, c.chunk_index, c.section, c.text,
-                   p.title, p.doi, p.year, p.source_hash,
-                   COALESCE(c.chunk_hash, ''), COALESCE(c.chunker_version, ''),
-                   COALESCE(c.section_kind, 'body'), c.caption_label,
+            SELECT {SOURCE_CHUNK_SELECT_COLUMNS},
                    f.fact_type, f.fact_json
             FROM paper_facts f
             JOIN chunks c ON c.paper_key = f.paper_key AND c.chunk_index = COALESCE(f.chunk_id, c.chunk_index)
             JOIN papers p ON p.paper_key = c.paper_key
             WHERE p.author = ?
             "#,
-        )?;
-        let rows = stmt.query_map(params![author], |row| {
-            Ok(FactRouteCandidate {
-                chunk: source_chunk_from_row(row)?,
-                fact_type: row.get(13)?,
-                fact_json: row.get(14)?,
-            })
-        })?;
+        ))?;
+        let rows = stmt.query_map(params![author], fact_route_candidate_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+}
+
+fn fact_route_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FactRouteCandidate> {
+    Ok(FactRouteCandidate {
+        chunk: source_chunk_from_row(row)?,
+        fact_type: row.get(SOURCE_CHUNK_COLUMN_COUNT)?,
+        fact_json: row.get(SOURCE_CHUNK_COLUMN_COUNT + 1)?,
+    })
 }

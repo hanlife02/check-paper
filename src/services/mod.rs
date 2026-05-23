@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod classification;
+pub mod comprehension;
 pub mod embedding;
 pub mod eval;
 pub mod extraction;
@@ -8,3 +9,4 @@ pub mod profile;
 pub mod qa;
 pub mod sources;
 pub mod status;
+pub mod sync;

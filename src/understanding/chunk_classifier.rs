@@ -183,6 +183,14 @@ mod tests {
                 chunker_version: "section-char-v1".to_string(),
                 section_kind: case.section_kind,
                 caption_label: None,
+                caption_object_type: None,
+                caption_object_label: None,
+                caption_panel_labels_json: None,
+                caption_target_labels_json: None,
+                caption_panel_details_json: None,
+                caption_measurements_json: None,
+                caption_conditions_json: None,
+                caption_values_json: None,
             });
             assert_eq!(decision.chunk_kind, case.expected_kind);
             assert_eq!(decision.skip_reason, case.expected_skip_reason.as_deref());
@@ -205,6 +213,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "figure_caption".to_string(),
             caption_label: Some("Figure 1".to_string()),
+            caption_object_type: Some("figure".to_string()),
+            caption_object_label: Some("1".to_string()),
+            caption_panel_labels_json: None,
+            caption_target_labels_json: Some("[\"Figure 1\"]".to_string()),
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         });
 
         assert_eq!(decision.chunk_kind, "figure_caption");
@@ -228,6 +244,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         });
 
         assert_eq!(decision.chunk_kind, "results");

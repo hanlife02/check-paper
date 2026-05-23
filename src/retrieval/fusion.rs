@@ -29,6 +29,8 @@ impl RankedChunk {
 }
 
 const RRF_K: f64 = 60.0;
+const LEXICAL_SEED_ROUTE: &str = "fts";
+const LEXICAL_SEED_LIMIT: usize = 3;
 
 pub fn rrf_merge_chunks(ranked_lists: Vec<Vec<SourceChunk>>, limit: usize) -> Vec<SourceChunk> {
     let mut scores: HashMap<i64, f64> = HashMap::new();
@@ -70,7 +72,8 @@ pub fn merge_chunk_routes(ranked_routes: &[ChunkRoute], limit: usize) -> (Vec<So
                 .collect()
         })
         .collect::<Vec<_>>();
-    let merged = rrf_merge_chunks(ranked_lists, limit);
+    let merged =
+        preserve_lexical_seed_chunks(ranked_routes, rrf_merge_chunks(ranked_lists, limit), limit);
     let trace = retrieval_trace(ranked_routes, &merged);
     (merged, trace)
 }
@@ -104,6 +107,14 @@ pub fn retrieval_trace(ranked_routes: &[ChunkRoute], merged: &[SourceChunk]) -> 
                         "section": chunk.chunk.section,
                         "section_kind": chunk.chunk.section_kind,
                         "caption_label": chunk.chunk.caption_label,
+                        "caption_object_type": chunk.chunk.caption_object_type,
+                        "caption_object_label": chunk.chunk.caption_object_label,
+                        "caption_panel_labels": chunk.chunk.caption_panel_labels_value(),
+                        "caption_target_labels": chunk.chunk.caption_target_labels_value(),
+                        "caption_panel_details": chunk.chunk.caption_panel_details_value(),
+                        "caption_measurements": chunk.chunk.caption_measurements_value(),
+                        "caption_conditions": chunk.chunk.caption_conditions_value(),
+                        "caption_values": chunk.chunk.caption_values_value(),
                     });
                     if let Some(route_score) = chunk.route_score {
                         candidate["route_score"] = json!(route_score);
@@ -127,6 +138,14 @@ pub fn retrieval_trace(ranked_routes: &[ChunkRoute], merged: &[SourceChunk]) -> 
                 "section": chunk.section,
                 "section_kind": chunk.section_kind,
                 "caption_label": chunk.caption_label,
+                "caption_object_type": chunk.caption_object_type,
+                "caption_object_label": chunk.caption_object_label,
+                "caption_panel_labels": chunk.caption_panel_labels_value(),
+                "caption_target_labels": chunk.caption_target_labels_value(),
+                "caption_panel_details": chunk.caption_panel_details_value(),
+                "caption_measurements": chunk.caption_measurements_value(),
+                "caption_conditions": chunk.caption_conditions_value(),
+                "caption_values": chunk.caption_values_value(),
             })
         })
         .collect::<Vec<_>>();
@@ -154,9 +173,56 @@ fn rrf_rank_score(rank: usize) -> f64 {
     1.0 / (RRF_K + rank as f64 + 1.0)
 }
 
+fn preserve_lexical_seed_chunks(
+    ranked_routes: &[ChunkRoute],
+    merged: Vec<SourceChunk>,
+    limit: usize,
+) -> Vec<SourceChunk> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let seeds = ranked_routes
+        .iter()
+        .filter(|(route, _)| *route == LEXICAL_SEED_ROUTE)
+        .flat_map(|(_, chunks)| chunks.iter().map(|candidate| candidate.chunk.clone()))
+        .take(LEXICAL_SEED_LIMIT)
+        .collect::<Vec<_>>();
+    if seeds.is_empty() {
+        return merged;
+    }
+
+    let mut seeded = Vec::with_capacity(limit);
+    let mut seen_ids = HashSet::new();
+    for seed in seeds {
+        if seen_ids.contains(&seed.id) {
+            continue;
+        }
+        seen_ids.insert(seed.id);
+        seeded.push(seed);
+        if seeded.len() >= limit {
+            return seeded;
+        }
+    }
+
+    for chunk in merged {
+        if seen_ids.contains(&chunk.id) {
+            continue;
+        }
+        seen_ids.insert(chunk.id);
+        seeded.push(chunk);
+        if seeded.len() >= limit {
+            break;
+        }
+    }
+    seeded
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RankedChunk, retrieval_trace, rrf_merge_chunks, unscored_route};
+    use super::{
+        RankedChunk, merge_chunk_routes, retrieval_trace, rrf_merge_chunks, unscored_route,
+    };
     use crate::storage::SourceChunk;
 
     #[test]
@@ -175,6 +241,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         };
         let merged = rrf_merge_chunks(
             vec![
@@ -204,6 +278,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         };
         let first = chunk(1);
         let second = chunk(2);
@@ -224,6 +306,47 @@ mod tests {
     }
 
     #[test]
+    fn merge_chunk_routes_preserves_top_fts_candidates() {
+        let chunk = |id| SourceChunk {
+            id,
+            paper_key: format!("Alice/paper-{id}"),
+            chunk_index: 0,
+            section: "Results".to_string(),
+            text: format!("chunk {id}"),
+            title: format!("Paper {id}"),
+            doi: String::new(),
+            year: "2024".to_string(),
+            source_hash: "hash".to_string(),
+            chunk_hash: "chunk-hash".to_string(),
+            chunker_version: "section-char-v1".to_string(),
+            section_kind: "body".to_string(),
+            caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
+        };
+        let exact = chunk(1);
+        let repeated = chunk(2);
+        let filler = chunk(3);
+        let (merged, _) = merge_chunk_routes(
+            &[
+                unscored_route("fts", vec![exact.clone(), filler.clone()]),
+                unscored_route("like", vec![repeated.clone(), filler.clone()]),
+                unscored_route("local_embedding", vec![repeated]),
+            ],
+            2,
+        );
+
+        assert!(merged.iter().any(|chunk| chunk.id == exact.id));
+        assert_eq!(merged[0].id, exact.id);
+    }
+
+    #[test]
     fn retrieval_trace_includes_optional_route_similarity_score() {
         let chunk = SourceChunk {
             id: 1,
@@ -239,6 +362,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         };
         let trace = retrieval_trace(
             &[("dense", vec![RankedChunk::scored(chunk.clone(), 0.42)])],

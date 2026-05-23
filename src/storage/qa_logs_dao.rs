@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
-use super::{QaLogEntry, QaLogStats, QaLogSummary, Storage};
+use super::{QaLogEntry, QaLogStats, QaLogSummary, QaLogTrend, Storage};
 
 impl Storage {
     pub(super) fn qa_log_stats(&self, author: Option<&str>) -> Result<QaLogStats> {
@@ -72,9 +72,11 @@ impl Storage {
                 author, question, retrieval_json, answer_json, model, latency_ms,
                 retrieval_trace_json, answer_schema_version, qa_prompt_version,
                 temperature, max_tokens, prompt_tokens, completion_tokens,
-                total_tokens, cost_usd, error_code
+                total_tokens, cost_usd, error_code, qa_profile_version, qa_mode, route_reason,
+                delivery_mode, streaming_finalized, stream_delta_count, streamed_chars,
+                stream_first_delta_ms, stream_duration_ms, telegram_chat_id, telegram_job_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 entry.author,
@@ -93,6 +95,17 @@ impl Storage {
                 metadata.total_tokens,
                 metadata.cost_usd,
                 metadata.error_code,
+                metadata.qa_profile_version,
+                metadata.qa_mode,
+                metadata.route_reason,
+                metadata.delivery_mode,
+                metadata.streaming_finalized,
+                metadata.stream_delta_count,
+                metadata.streamed_chars,
+                metadata.stream_first_delta_ms,
+                metadata.stream_duration_ms,
+                metadata.telegram_chat_id,
+                metadata.telegram_job_id,
             ],
         )?;
         Ok(())
@@ -124,7 +137,11 @@ impl Storage {
     pub fn qa_logs(&self, author: Option<&str>, limit: usize) -> Result<Vec<QaLogSummary>> {
         let mut sql = r#"
             SELECT id, author, question, model, latency_ms, prompt_tokens,
-                   completion_tokens, total_tokens, cost_usd, error_code, created_at
+                   completion_tokens, total_tokens, cost_usd, error_code,
+                   qa_profile_version, qa_mode, route_reason, delivery_mode,
+                   streaming_finalized, stream_delta_count, streamed_chars,
+                   stream_first_delta_ms, stream_duration_ms,
+                   telegram_chat_id, telegram_job_id, created_at
             FROM qa_logs
             WHERE 1 = 1
         "#
@@ -150,7 +167,65 @@ impl Storage {
                 total_tokens: row.get(7)?,
                 cost_usd: row.get(8)?,
                 error_code: row.get(9)?,
-                created_at: row.get(10)?,
+                qa_profile_version: row.get(10)?,
+                qa_mode: row.get(11)?,
+                route_reason: row.get(12)?,
+                delivery_mode: row.get(13)?,
+                streaming_finalized: row.get(14)?,
+                stream_delta_count: row.get(15)?,
+                streamed_chars: row.get(16)?,
+                stream_first_delta_ms: row.get(17)?,
+                stream_duration_ms: row.get(18)?,
+                telegram_chat_id: row.get(19)?,
+                telegram_job_id: row.get(20)?,
+                created_at: row.get(21)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn qa_log_trend(&self, author: Option<&str>, days: usize) -> Result<Vec<QaLogTrend>> {
+        let mut sql = r#"
+            SELECT date(created_at) AS day,
+                   COUNT(*),
+                   SUM(CASE WHEN error_code IS NOT NULL AND error_code != '' THEN 1 ELSE 0 END),
+                   AVG(latency_ms),
+                   SUM(total_tokens),
+                   SUM(cost_usd),
+                   SUM(CASE WHEN delivery_mode = 'streaming' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN streaming_finalized = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN telegram_chat_id IS NOT NULL AND telegram_job_id IS NOT NULL THEN 1 ELSE 0 END)
+            FROM qa_logs
+            WHERE 1 = 1
+        "#
+        .to_string();
+        let mut values = Vec::new();
+        if let Some(author) = author {
+            sql.push_str(" AND author = ?");
+            values.push(author.to_string());
+        }
+        sql.push_str(
+            r#"
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT ?
+            "#,
+        );
+        values.push(days.to_string());
+        let params = rusqlite::params_from_iter(values.iter());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params, |row| {
+            Ok(QaLogTrend {
+                day: row.get(0)?,
+                total: row.get(1)?,
+                errors: row.get(2)?,
+                avg_latency_ms: row.get(3)?,
+                total_tokens: row.get(4)?,
+                total_cost_usd: row.get(5)?,
+                streaming: row.get(6)?,
+                streaming_finalized: row.get(7)?,
+                telegram: row.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

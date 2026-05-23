@@ -128,6 +128,12 @@ impl Storage {
         self.apply_chunk_classification_migration()?;
         self.apply_chunk_fact_migration()?;
         self.apply_chunk_fact_failure_migration()?;
+        self.apply_paper_profile_v2_migration()?;
+        self.apply_author_profile_v2_migration()?;
+        self.apply_telegram_chat_settings_migration()?;
+        self.apply_runtime_heartbeats_migration()?;
+        self.apply_telegram_delivery_logs_migration()?;
+        self.apply_telegram_pending_author_selections_migration()?;
         Ok(())
     }
 
@@ -150,6 +156,17 @@ impl Storage {
             ("qa_logs", "cost_usd", "REAL"),
             ("qa_logs", "error_code", "TEXT"),
             ("qa_logs", "retrieval_trace_json", "TEXT"),
+            ("qa_logs", "qa_profile_version", "TEXT"),
+            ("qa_logs", "qa_mode", "TEXT"),
+            ("qa_logs", "route_reason", "TEXT"),
+            ("qa_logs", "delivery_mode", "TEXT"),
+            ("qa_logs", "streaming_finalized", "INTEGER"),
+            ("qa_logs", "stream_delta_count", "INTEGER"),
+            ("qa_logs", "streamed_chars", "INTEGER"),
+            ("qa_logs", "stream_first_delta_ms", "INTEGER"),
+            ("qa_logs", "stream_duration_ms", "INTEGER"),
+            ("qa_logs", "telegram_chat_id", "INTEGER"),
+            ("qa_logs", "telegram_job_id", "INTEGER"),
             ("analysis_jobs", "source_hash", "TEXT"),
             ("analysis_jobs", "profile_schema_version", "INTEGER"),
             ("analysis_jobs", "prompt_version", "TEXT"),
@@ -188,6 +205,14 @@ impl Storage {
             ("chunks", "section_path", "TEXT"),
             ("chunks", "section_kind", "TEXT"),
             ("chunks", "caption_label", "TEXT"),
+            ("chunks", "caption_object_type", "TEXT"),
+            ("chunks", "caption_object_label", "TEXT"),
+            ("chunks", "caption_panel_labels_json", "TEXT"),
+            ("chunks", "caption_target_labels_json", "TEXT"),
+            ("chunks", "caption_panel_details_json", "TEXT"),
+            ("chunks", "caption_measurements_json", "TEXT"),
+            ("chunks", "caption_conditions_json", "TEXT"),
+            ("chunks", "caption_values_json", "TEXT"),
         ] {
             if !self.column_exists(table, column)? {
                 self.conn.execute(
@@ -196,6 +221,10 @@ impl Storage {
                 )?;
             }
         }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_qa_logs_telegram_delivery ON qa_logs(telegram_chat_id, telegram_job_id)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -420,6 +449,218 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_chunk_fact_failures_paper_key
                 ON chunk_fact_failures(paper_key);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_paper_profile_v2_migration(&self) -> Result<()> {
+        self.apply_migration(
+            6,
+            "paper_profiles_v2",
+            r#"
+            CREATE TABLE IF NOT EXISTS paper_profiles_v2 (
+                paper_key TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                profile_schema_version INTEGER NOT NULL,
+                builder_version TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                source_fact_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (paper_key) REFERENCES papers(paper_key) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_paper_profiles_v2_schema
+                ON paper_profiles_v2(profile_schema_version, builder_version, model_id);
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS paper_profiles_v2 (
+                paper_key TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                profile_schema_version INTEGER NOT NULL,
+                builder_version TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                source_fact_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (paper_key) REFERENCES papers(paper_key) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_paper_profiles_v2_schema
+                ON paper_profiles_v2(profile_schema_version, builder_version, model_id);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_author_profile_v2_migration(&self) -> Result<()> {
+        self.apply_migration(
+            7,
+            "author_profiles_v2",
+            r#"
+            CREATE TABLE IF NOT EXISTS author_profiles_v2 (
+                author TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                profile_schema_version INTEGER NOT NULL,
+                builder_version TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                source_profile_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_author_profiles_v2_schema
+                ON author_profiles_v2(profile_schema_version, builder_version, model_id);
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS author_profiles_v2 (
+                author TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                profile_schema_version INTEGER NOT NULL,
+                builder_version TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                source_profile_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_author_profiles_v2_schema
+                ON author_profiles_v2(profile_schema_version, builder_version, model_id);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_telegram_chat_settings_migration(&self) -> Result<()> {
+        self.apply_migration(
+            8,
+            "telegram_chat_settings",
+            r#"
+            CREATE TABLE IF NOT EXISTS telegram_chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                default_author TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS telegram_chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                default_author TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_runtime_heartbeats_migration(&self) -> Result<()> {
+        self.apply_migration(
+            9,
+            "runtime_heartbeats",
+            r#"
+            CREATE TABLE IF NOT EXISTS runtime_heartbeats (
+                name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS runtime_heartbeats (
+                name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_telegram_delivery_logs_migration(&self) -> Result<()> {
+        self.apply_migration(
+            10,
+            "telegram_delivery_logs",
+            r#"
+            CREATE TABLE IF NOT EXISTS telegram_delivery_logs (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                final_delivery TEXT NOT NULL,
+                preview_edit_attempts INTEGER NOT NULL DEFAULT 0,
+                preview_edit_successes INTEGER NOT NULL DEFAULT 0,
+                preview_edit_failures INTEGER NOT NULL DEFAULT 0,
+                preview_last_chars INTEGER NOT NULL DEFAULT 0,
+                reply_chars INTEGER NOT NULL DEFAULT 0,
+                cancelled INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_telegram_delivery_logs_chat_id
+                ON telegram_delivery_logs(chat_id);
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS telegram_delivery_logs (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                final_delivery TEXT NOT NULL,
+                preview_edit_attempts INTEGER NOT NULL DEFAULT 0,
+                preview_edit_successes INTEGER NOT NULL DEFAULT 0,
+                preview_edit_failures INTEGER NOT NULL DEFAULT 0,
+                preview_last_chars INTEGER NOT NULL DEFAULT 0,
+                reply_chars INTEGER NOT NULL DEFAULT 0,
+                cancelled INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_telegram_delivery_logs_chat_id
+                ON telegram_delivery_logs(chat_id);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn apply_telegram_pending_author_selections_migration(&self) -> Result<()> {
+        self.apply_migration(
+            11,
+            "telegram_pending_author_selections",
+            r#"
+            CREATE TABLE IF NOT EXISTS telegram_pending_author_selections (
+                chat_id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                question TEXT,
+                authors_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS telegram_pending_author_selections (
+                chat_id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                question TEXT,
+                authors_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             "#,
         )?;
         Ok(())

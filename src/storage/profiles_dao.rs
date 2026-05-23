@@ -86,6 +86,10 @@ impl Storage {
         Ok(profiles)
     }
 
+    pub(crate) fn profile_route_candidates(&self, author: &str) -> Result<Vec<Value>> {
+        self.paper_profiles(author, None)
+    }
+
     pub fn save_author_profile(&self, author: &str, profile: &Value) -> Result<()> {
         self.save_author_profile_with_metadata(author, profile, 1, "", "", "")
     }

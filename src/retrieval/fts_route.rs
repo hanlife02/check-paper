@@ -12,7 +12,7 @@ pub(crate) fn search_fts_route(
     if match_query.is_empty() {
         return Ok(Vec::new());
     }
-    storage.search_chunks_fts(author, &match_query, limit)
+    storage.fts_route_candidates(author, &match_query, limit)
 }
 
 pub fn fts_match_query(terms: &[String]) -> String {

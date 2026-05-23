@@ -274,6 +274,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         }
     }
 

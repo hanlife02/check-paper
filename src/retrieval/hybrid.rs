@@ -10,7 +10,7 @@ use crate::retrieval::fusion::{
     ChunkRoute, empty_retrieval_trace, merge_chunk_routes, unscored_route,
 };
 use crate::retrieval::like_route::search_like_route;
-use crate::retrieval::profile_route::search_profile_route;
+use crate::retrieval::profile_route::{profile_grounding_chunks_for_keys, search_profile_route};
 use crate::retrieval::query::query_terms;
 use crate::storage::{SourceChunk, Storage};
 
@@ -94,7 +94,7 @@ fn add_profile_route(
         .filter_map(|profile| profile.get("paper_key").and_then(Value::as_str))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let profile_rows = storage.chunks_for_paper_keys(&paper_keys, 20)?;
+    let profile_rows = profile_grounding_chunks_for_keys(storage, &paper_keys, 20)?;
     if !profile_rows.is_empty() {
         ranked_routes.push(unscored_route("profile", profile_rows));
     }

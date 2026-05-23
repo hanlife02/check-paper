@@ -12,6 +12,7 @@ use tokio::time::{Instant, sleep};
 
 use super::dispatcher::{ChatDispatcher, DispatchAction};
 use super::handlers::BotHandlers;
+use crate::storage::NewTelegramDeliveryLog;
 
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const TELEGRAM_REQUEST_TIMEOUT_SECS: u64 = TELEGRAM_POLL_TIMEOUT_SECS + 20;
@@ -24,10 +25,51 @@ const TELEGRAM_LLM_CONCURRENCY: usize = 2;
 const TELEGRAM_STREAM_EDIT_INTERVAL_MS: u64 = 1200;
 const TELEGRAM_STREAM_MIN_EDIT_CHARS: usize = 24;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StreamPreviewStats {
+    edit_attempts: usize,
+    edit_successes: usize,
+    edit_failures: usize,
+    last_preview_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalDelivery {
+    Empty,
+    EditedPlaceholder,
+    SentFallback,
+    SkippedCancelled,
+    Failed,
+}
+
+impl FinalDelivery {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::EditedPlaceholder => "edited_placeholder",
+            Self::SentFallback => "sent_fallback",
+            Self::SkippedCancelled => "skipped_cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TelegramDeliveryEvent<'a> {
+    chat_id: i64,
+    job_id: u64,
+    final_delivery: FinalDelivery,
+    preview_stats: StreamPreviewStats,
+    reply_chars: usize,
+    cancelled: bool,
+    error_code: Option<&'a str>,
+}
+
 #[derive(Clone)]
 pub struct TelegramBot {
     token: String,
     allowed_chat_ids: Vec<i64>,
+    admin_user_ids: Vec<i64>,
     handlers: Arc<BotHandlers>,
     http: Client,
     cancelled_jobs: Arc<Mutex<HashSet<u64>>>,
@@ -38,12 +80,14 @@ impl TelegramBot {
     pub fn new(
         token: String,
         allowed_chat_ids: Vec<i64>,
+        admin_user_ids: Vec<i64>,
         proxy: Option<String>,
         handlers: BotHandlers,
     ) -> Result<Self> {
         Ok(Self {
             token,
             allowed_chat_ids,
+            admin_user_ids,
             handlers: Arc::new(handlers),
             http: http_client(proxy.as_deref())?,
             cancelled_jobs: Arc::new(Mutex::new(HashSet::new())),
@@ -66,6 +110,7 @@ impl TelegramBot {
             format_bot_username(bot_username.as_deref()),
             format_allowed_chat_ids(&self.allowed_chat_ids)
         );
+        self.record_heartbeat("started");
         let mut offset = 0i64;
         let mut dispatcher = ChatDispatcher::default();
         let (done_tx, mut done_rx) = unbounded_channel::<i64>();
@@ -82,6 +127,7 @@ impl TelegramBot {
                         "Telegram polling temporarily failed: {}",
                         telegram_error_message(&err, &self.token)
                     );
+                    self.record_heartbeat("temporary_failed");
                     sleep(Duration::from_secs(TELEGRAM_POLL_RETRY_DELAY_SECS)).await;
                     continue;
                 }
@@ -92,6 +138,7 @@ impl TelegramBot {
                     ));
                 }
             };
+            self.record_heartbeat("polling");
             for update in updates {
                 offset = offset.max(update.update_id + 1);
                 let Some(message) = update.message.or(update.edited_message) else {
@@ -137,6 +184,12 @@ impl TelegramBot {
                 self.apply_dispatch_action(action, done_tx.clone()).await?;
             }
             sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
+    fn record_heartbeat(&self, status: &str) {
+        if let Err(err) = self.handlers.record_telegram_heartbeat(status) {
+            eprintln!("Telegram heartbeat write failed: {err}");
         }
     }
 
@@ -237,29 +290,103 @@ impl TelegramBot {
         let preview_task = tokio::task::spawn_local(async move {
             preview_bot
                 .stream_preview_updates(chat_id, preview_message_id, delta_rx)
-                .await;
+                .await
         });
         let reply = self
-            .handle_text_streaming(chat_id, text.to_string(), move |delta| {
+            .handle_text_streaming(chat_id, job_id, text.to_string(), move |delta| {
                 let _ = delta_tx.send(delta.to_string());
                 Ok(())
             })
             .await?;
-        if let Err(err) = preview_task.await {
-            eprintln!("Telegram stream preview task failed: {err}");
-        }
+        let preview_stats = match preview_task.await {
+            Ok(stats) => stats,
+            Err(err) => {
+                eprintln!("Telegram stream preview task failed: {err}");
+                StreamPreviewStats::default()
+            }
+        };
         eprintln!(
-            "Telegram handler completed: chat {chat_id} reply_chars={}",
-            reply.chars().count()
+            "Telegram handler completed: chat {chat_id} reply_chars={} preview_edit_attempts={} preview_edit_successes={} preview_edit_failures={} preview_last_chars={}",
+            reply.chars().count(),
+            preview_stats.edit_attempts,
+            preview_stats.edit_successes,
+            preview_stats.edit_failures,
+            preview_stats.last_preview_chars,
         );
 
         if self.is_job_cancelled(job_id) {
+            eprintln!(
+                "Telegram final reply skipped: chat {chat_id} job_cancelled=true preview_edit_attempts={} preview_edit_successes={} preview_edit_failures={}",
+                preview_stats.edit_attempts,
+                preview_stats.edit_successes,
+                preview_stats.edit_failures,
+            );
+            self.record_delivery_log(TelegramDeliveryEvent {
+                chat_id,
+                job_id,
+                final_delivery: FinalDelivery::SkippedCancelled,
+                preview_stats,
+                reply_chars: reply.chars().count(),
+                cancelled: true,
+                error_code: Some("cancelled"),
+            });
             return Ok(());
         }
-        self.replace_message_with_long_text(chat_id, placeholder.message_id, &reply)
-            .await?;
-        eprintln!("Telegram final reply sent: chat {chat_id}");
+        let final_delivery = match self
+            .replace_message_with_long_text(chat_id, placeholder.message_id, &reply)
+            .await
+        {
+            Ok(final_delivery) => final_delivery,
+            Err(err) => {
+                self.record_delivery_log(TelegramDeliveryEvent {
+                    chat_id,
+                    job_id,
+                    final_delivery: FinalDelivery::Failed,
+                    preview_stats,
+                    reply_chars: reply.chars().count(),
+                    cancelled: false,
+                    error_code: Some("final_delivery_failed"),
+                });
+                return Err(err);
+            }
+        };
+        eprintln!(
+            "Telegram final reply sent: chat {chat_id} final_delivery={} preview_edit_attempts={} preview_edit_successes={} preview_edit_failures={}",
+            final_delivery.as_str(),
+            preview_stats.edit_attempts,
+            preview_stats.edit_successes,
+            preview_stats.edit_failures,
+        );
+        self.record_delivery_log(TelegramDeliveryEvent {
+            chat_id,
+            job_id,
+            final_delivery,
+            preview_stats,
+            reply_chars: reply.chars().count(),
+            cancelled: false,
+            error_code: None,
+        });
         Ok(())
+    }
+
+    fn record_delivery_log(&self, event: TelegramDeliveryEvent<'_>) {
+        if let Err(err) = self
+            .handlers
+            .record_telegram_delivery(NewTelegramDeliveryLog {
+                chat_id: event.chat_id,
+                job_id: i64::try_from(event.job_id).unwrap_or(i64::MAX),
+                final_delivery: event.final_delivery.as_str(),
+                preview_edit_attempts: event.preview_stats.edit_attempts as i64,
+                preview_edit_successes: event.preview_stats.edit_successes as i64,
+                preview_edit_failures: event.preview_stats.edit_failures as i64,
+                preview_last_chars: event.preview_stats.last_preview_chars as i64,
+                reply_chars: event.reply_chars as i64,
+                cancelled: event.cancelled,
+                error_code: event.error_code,
+            })
+        {
+            eprintln!("Telegram delivery log save failed: {err}");
+        }
     }
 
     async fn stream_preview_updates(
@@ -267,7 +394,8 @@ impl TelegramBot {
         chat_id: i64,
         message_id: i64,
         mut delta_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
-    ) {
+    ) -> StreamPreviewStats {
+        let mut stats = StreamPreviewStats::default();
         let mut raw = String::new();
         let mut last_sent = String::new();
         let mut last_edit = Instant::now() - Duration::from_secs(60);
@@ -289,16 +417,21 @@ impl TelegramBot {
             {
                 continue;
             }
+            stats.edit_attempts += 1;
             match self.edit_message(chat_id, message_id, &preview).await {
                 Ok(_) => {
+                    stats.edit_successes += 1;
+                    stats.last_preview_chars = preview.chars().count();
                     last_sent = preview;
                     last_edit = Instant::now();
                 }
                 Err(err) => {
+                    stats.edit_failures += 1;
                     eprintln!("Telegram stream preview edit failed: {err}");
                 }
             }
         }
+        stats
     }
 
     async fn handle_text_blocking(&self, chat_id: i64, text: String) -> Result<String> {
@@ -312,6 +445,7 @@ impl TelegramBot {
     async fn handle_text_streaming<F>(
         &self,
         chat_id: i64,
+        job_id: u64,
         text: String,
         on_delta: F,
     ) -> Result<String>
@@ -320,7 +454,12 @@ impl TelegramBot {
     {
         Ok(self
             .handlers
-            .handle_text_stream(chat_id, &text, on_delta)
+            .handle_text_stream(
+                chat_id,
+                i64::try_from(job_id).unwrap_or(i64::MAX),
+                &text,
+                on_delta,
+            )
             .await
             .unwrap_or_else(|err| format!("处理失败：{err}")))
     }
@@ -352,6 +491,11 @@ impl TelegramBot {
         }
 
         if bot_username.is_some_and(|username| mentions_bot(text, username)) {
+            if let Some(reason) =
+                group_permission_skip_reason(message, text, bot_username, &self.admin_user_ids)
+            {
+                return Some(reason);
+            }
             return None;
         }
 
@@ -439,20 +583,21 @@ impl TelegramBot {
         chat_id: i64,
         message_id: i64,
         text: &str,
-    ) -> Result<()> {
+    ) -> Result<FinalDelivery> {
         let pages = telegram_message_pages(text);
         let Some(first) = pages.first() else {
-            return Ok(());
+            return Ok(FinalDelivery::Empty);
         };
         if let Err(err) = self.edit_message(chat_id, message_id, first).await {
             eprintln!("Telegram final edit failed, sending a new message instead: {err}");
-            return self.send_long_message(chat_id, text).await;
+            self.send_long_message(chat_id, text).await?;
+            return Ok(FinalDelivery::SentFallback);
         }
         for page in pages.iter().skip(1) {
             sleep(Duration::from_millis(1050)).await;
             self.send_message(chat_id, page).await?;
         }
-        Ok(())
+        Ok(FinalDelivery::EditedPlaceholder)
     }
 }
 
@@ -478,18 +623,57 @@ where
     Ok(response.error_for_status()?)
 }
 
+fn group_permission_skip_reason(
+    message: &Message,
+    text: &str,
+    bot_username: Option<&str>,
+    admin_user_ids: &[i64],
+) -> Option<&'static str> {
+    let handler_text = handler_text_after_bot_mention(text, bot_username);
+    if !is_admin_only_telegram_command(handler_text.trim()) {
+        return None;
+    }
+    let sender_id = message.from.as_ref().map(|user| user.id);
+    if sender_id.is_some_and(|sender_id| admin_user_ids.contains(&sender_id)) {
+        return None;
+    }
+    Some("group admin-only command requires TELEGRAM_ADMIN_USER_IDS")
+}
+
+fn is_admin_only_telegram_command(text: &str) -> bool {
+    let Some(command) = telegram_command_name(text) else {
+        return false;
+    };
+    if matches!(
+        command,
+        "/sync"
+            | "/analyze"
+            | "/embed"
+            | "/embedding"
+            | "/comprehend"
+            | "/rebuild"
+            | "/rebuild_profile"
+            | "/profile_rebuild"
+    ) {
+        return true;
+    }
+    command == "/profile"
+        && text
+            .split_whitespace()
+            .skip(1)
+            .any(|arg| matches!(arg, "--rebuild" | "rebuild"))
+}
+
+fn telegram_command_name(text: &str) -> Option<&str> {
+    let token = text.split_whitespace().next()?;
+    token
+        .starts_with('/')
+        .then_some(token.split('@').next().unwrap_or(token))
+}
+
 fn should_stream_text(text: &str) -> bool {
     let stripped = text.trim();
-    !stripped.starts_with("/start")
-        && !stripped.starts_with("/help")
-        && !stripped.starts_with("/authors")
-        && !stripped.starts_with("/profile")
-        && !stripped.starts_with("/sources")
-        && !stripped.starts_with("/status")
-        && !stripped.starts_with("/jobs")
-        && !stripped.starts_with("/cancel")
-        && !stripped.starts_with("/use_author")
-        && !stripped.starts_with("/current_author")
+    stripped.starts_with("/ask") || !stripped.starts_with('/')
 }
 
 fn is_dispatcher_cancel_command(text: &str) -> bool {
@@ -683,6 +867,7 @@ struct Update {
 
 #[derive(Deserialize)]
 struct Message {
+    from: Option<User>,
     chat: Chat,
     text: Option<String>,
 }
@@ -707,6 +892,7 @@ impl Chat {
 
 #[derive(Deserialize)]
 struct User {
+    id: i64,
     username: Option<String>,
 }
 
@@ -764,9 +950,12 @@ fn is_command_boundary(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_MESSAGE_CHARS, handler_text_after_bot_mention, is_dispatcher_cancel_command,
-        mentions_bot, partial_json_string_field, redact_telegram_token, should_stream_text,
-        streaming_answer_preview, strip_bot_mention, telegram_message_pages, telegram_retry_after,
+        Chat, FinalDelivery, Message, TELEGRAM_MAX_MESSAGE_CHARS, User,
+        group_permission_skip_reason, handler_text_after_bot_mention,
+        is_admin_only_telegram_command, is_dispatcher_cancel_command, mentions_bot,
+        partial_json_string_field, redact_telegram_token, should_stream_text,
+        streaming_answer_preview, strip_bot_mention, telegram_command_name, telegram_message_pages,
+        telegram_retry_after,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -837,6 +1026,64 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_admin_only_group_commands() {
+        assert!(is_admin_only_telegram_command("/analyze"));
+        assert!(is_admin_only_telegram_command(
+            "/analyze@PaperCheckBot Alice"
+        ));
+        assert!(is_admin_only_telegram_command("/profile --rebuild Alice"));
+        assert!(!is_admin_only_telegram_command("/ask question"));
+        assert!(!is_admin_only_telegram_command("/status detail"));
+        assert_eq!(
+            telegram_command_name("/analyze@PaperCheckBot Alice"),
+            Some("/analyze")
+        );
+    }
+
+    #[test]
+    fn group_admin_only_commands_require_admin_user_id() {
+        let message = Message {
+            from: Some(User {
+                id: 100,
+                username: Some("ordinary".to_string()),
+            }),
+            chat: Chat {
+                id: -7,
+                kind: "supergroup".to_string(),
+            },
+            text: Some("/analyze@PaperCheckBot Alice".to_string()),
+        };
+
+        assert_eq!(
+            group_permission_skip_reason(
+                &message,
+                "/analyze@PaperCheckBot Alice",
+                Some("PaperCheckBot"),
+                &[42],
+            ),
+            Some("group admin-only command requires TELEGRAM_ADMIN_USER_IDS")
+        );
+        assert_eq!(
+            group_permission_skip_reason(
+                &message,
+                "/analyze@PaperCheckBot Alice",
+                Some("PaperCheckBot"),
+                &[100],
+            ),
+            None
+        );
+        assert_eq!(
+            group_permission_skip_reason(
+                &message,
+                "/ask@PaperCheckBot question",
+                Some("PaperCheckBot"),
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn paginates_long_messages_without_truncating() {
         let text = format!(
             "{}\n\n{}",
@@ -864,7 +1111,10 @@ mod tests {
         assert!(!should_stream_text("/status"));
         assert!(!should_stream_text("/jobs"));
         assert!(!should_stream_text("/cancel"));
+        assert!(!should_stream_text("/sync Alice"));
+        assert!(!should_stream_text("/analyze Alice"));
         assert!(should_stream_text("/ask 问题"));
+        assert!(should_stream_text("这篇论文讲什么"));
     }
 
     #[test]
@@ -885,6 +1135,21 @@ mod tests {
             partial_json_string_field(raw, "answer").as_deref(),
             Some("正在生成一段还没有闭合的回答")
         );
+    }
+
+    #[test]
+    fn final_delivery_labels_are_stable_for_logs() {
+        assert_eq!(FinalDelivery::Empty.as_str(), "empty");
+        assert_eq!(
+            FinalDelivery::EditedPlaceholder.as_str(),
+            "edited_placeholder"
+        );
+        assert_eq!(FinalDelivery::SentFallback.as_str(), "sent_fallback");
+        assert_eq!(
+            FinalDelivery::SkippedCancelled.as_str(),
+            "skipped_cancelled"
+        );
+        assert_eq!(FinalDelivery::Failed.as_str(), "failed");
     }
 
     #[test]

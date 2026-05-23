@@ -5,6 +5,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::Value;
 
+mod author_profiles_v2_dao;
 mod chunk_classifications_dao;
 mod chunk_facts_dao;
 mod chunks_dao;
@@ -12,9 +13,12 @@ mod embeddings_dao;
 mod facts_dao;
 mod jobs_dao;
 mod migrations;
+mod paper_profiles_v2_dao;
 mod papers_dao;
 mod profiles_dao;
 mod qa_logs_dao;
+mod runtime_dao;
+mod telegram_dao;
 
 #[derive(Debug, Clone)]
 pub struct AnalysisCandidate {
@@ -43,6 +47,47 @@ pub struct SourceChunk {
     pub chunker_version: String,
     pub section_kind: String,
     pub caption_label: Option<String>,
+    pub caption_object_type: Option<String>,
+    pub caption_object_label: Option<String>,
+    pub caption_panel_labels_json: Option<String>,
+    pub caption_target_labels_json: Option<String>,
+    pub caption_panel_details_json: Option<String>,
+    pub caption_measurements_json: Option<String>,
+    pub caption_conditions_json: Option<String>,
+    pub caption_values_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FactRouteCandidate {
+    pub chunk: SourceChunk,
+    pub fact_type: String,
+    pub fact_json: String,
+}
+
+impl SourceChunk {
+    pub fn caption_panel_labels_value(&self) -> Value {
+        optional_json_array(&self.caption_panel_labels_json)
+    }
+
+    pub fn caption_target_labels_value(&self) -> Value {
+        optional_json_array(&self.caption_target_labels_json)
+    }
+
+    pub fn caption_panel_details_value(&self) -> Value {
+        optional_json_array(&self.caption_panel_details_json)
+    }
+
+    pub fn caption_measurements_value(&self) -> Value {
+        optional_json_array(&self.caption_measurements_json)
+    }
+
+    pub fn caption_conditions_value(&self) -> Value {
+        optional_json_array(&self.caption_conditions_json)
+    }
+
+    pub fn caption_values_value(&self) -> Value {
+        optional_json_array(&self.caption_values_json)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +145,48 @@ pub struct NewChunkFact<'a> {
     pub chunk_hash: &'a str,
 }
 
+#[derive(Debug, Clone)]
+pub struct PaperProfileV2Record {
+    pub paper_key: String,
+    pub profile_json: Value,
+    pub profile_schema_version: i64,
+    pub builder_version: String,
+    pub model_id: String,
+    pub source_fact_hash: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewPaperProfileV2<'a> {
+    pub paper_key: &'a str,
+    pub profile_json: &'a Value,
+    pub profile_schema_version: i64,
+    pub builder_version: &'a str,
+    pub model_id: &'a str,
+    pub source_fact_hash: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorProfileV2Record {
+    pub author: String,
+    pub profile_json: Value,
+    pub profile_schema_version: i64,
+    pub builder_version: String,
+    pub model_id: String,
+    pub source_profile_hash: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewAuthorProfileV2<'a> {
+    pub author: &'a str,
+    pub profile_json: &'a Value,
+    pub profile_schema_version: i64,
+    pub builder_version: &'a str,
+    pub model_id: &'a str,
+    pub source_profile_hash: &'a str,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -150,7 +237,130 @@ pub struct QaLogSummary {
     pub total_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub error_code: Option<String>,
+    pub qa_profile_version: Option<String>,
+    pub qa_mode: Option<String>,
+    pub route_reason: Option<String>,
+    pub delivery_mode: Option<String>,
+    pub streaming_finalized: Option<bool>,
+    pub stream_delta_count: Option<i64>,
+    pub streamed_chars: Option<i64>,
+    pub stream_first_delta_ms: Option<i64>,
+    pub stream_duration_ms: Option<i64>,
+    pub telegram_chat_id: Option<i64>,
+    pub telegram_job_id: Option<i64>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QaLogTrend {
+    pub day: String,
+    pub total: i64,
+    pub errors: i64,
+    pub avg_latency_ms: Option<f64>,
+    pub total_tokens: Option<i64>,
+    pub total_cost_usd: Option<f64>,
+    pub streaming: i64,
+    pub streaming_finalized: i64,
+    pub telegram: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHeartbeat {
+    pub name: String,
+    pub status: String,
+    pub updated_at: String,
+    pub age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewTelegramDeliveryLog<'a> {
+    pub chat_id: i64,
+    pub job_id: i64,
+    pub final_delivery: &'a str,
+    pub preview_edit_attempts: i64,
+    pub preview_edit_successes: i64,
+    pub preview_edit_failures: i64,
+    pub preview_last_chars: i64,
+    pub reply_chars: i64,
+    pub cancelled: bool,
+    pub error_code: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewTelegramPendingAuthorSelection<'a> {
+    pub chat_id: i64,
+    pub action: &'a str,
+    pub question: Option<&'a str>,
+    pub authors: &'a [String],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramPendingAuthorSelection {
+    pub chat_id: i64,
+    pub action: String,
+    pub question: Option<String>,
+    pub authors: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramDeliveryLog {
+    pub id: i64,
+    pub chat_id: i64,
+    pub job_id: i64,
+    pub final_delivery: String,
+    pub preview_edit_attempts: i64,
+    pub preview_edit_successes: i64,
+    pub preview_edit_failures: i64,
+    pub preview_last_chars: i64,
+    pub reply_chars: i64,
+    pub cancelled: bool,
+    pub error_code: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramDeliverySummary {
+    pub final_delivery: String,
+    pub error_code: Option<String>,
+    pub total: i64,
+    pub cancelled: i64,
+    pub preview_edit_attempts: i64,
+    pub preview_edit_successes: i64,
+    pub preview_edit_failures: i64,
+    pub reply_chars: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramQaDeliveryLog {
+    pub id: i64,
+    pub chat_id: i64,
+    pub job_id: i64,
+    pub final_delivery: String,
+    pub cancelled: bool,
+    pub error_code: Option<String>,
+    pub created_at: String,
+    pub qa_log_id: Option<i64>,
+    pub qa_author: Option<String>,
+    pub qa_question: Option<String>,
+    pub qa_error_code: Option<String>,
+    pub qa_mode: Option<String>,
+    pub route_reason: Option<String>,
+    pub streaming_finalized: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramDeliveryTrend {
+    pub day: String,
+    pub total: i64,
+    pub cancelled: i64,
+    pub failed: i64,
+    pub edited_placeholder: i64,
+    pub sent_fallback: i64,
+    pub matched_qa: i64,
+    pub preview_edit_attempts: i64,
+    pub preview_edit_failures: i64,
+    pub reply_chars: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +382,17 @@ pub struct QaLogMetadata<'a> {
     pub total_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub error_code: Option<&'a str>,
+    pub qa_profile_version: Option<&'a str>,
+    pub qa_mode: Option<&'a str>,
+    pub route_reason: Option<&'a str>,
+    pub delivery_mode: Option<&'a str>,
+    pub streaming_finalized: Option<bool>,
+    pub stream_delta_count: Option<i64>,
+    pub streamed_chars: Option<i64>,
+    pub stream_first_delta_ms: Option<i64>,
+    pub stream_duration_ms: Option<i64>,
+    pub telegram_chat_id: Option<i64>,
+    pub telegram_job_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -240,18 +461,47 @@ fn source_chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceChun
         chunker_version: row.get(10)?,
         section_kind: row.get(11)?,
         caption_label: row.get(12)?,
+        caption_object_type: row.get(13)?,
+        caption_object_label: row.get(14)?,
+        caption_panel_labels_json: row.get(15)?,
+        caption_target_labels_json: row.get(16)?,
+        caption_panel_details_json: row.get(17)?,
+        caption_measurements_json: row.get(18)?,
+        caption_conditions_json: row.get(19)?,
+        caption_values_json: row.get(20)?,
     })
 }
 
+pub(super) const SOURCE_CHUNK_SELECT_COLUMNS: &str = r#"
+    c.id, c.paper_key, c.chunk_index, c.section, c.text,
+    p.title, p.doi, p.year, p.source_hash,
+    COALESCE(c.chunk_hash, ''), COALESCE(c.chunker_version, ''),
+    COALESCE(c.section_kind, 'body'), c.caption_label,
+    c.caption_object_type, c.caption_object_label,
+    c.caption_panel_labels_json, c.caption_target_labels_json,
+    c.caption_panel_details_json,
+    c.caption_measurements_json, c.caption_conditions_json,
+    c.caption_values_json
+"#;
+
+pub(super) const SOURCE_CHUNK_COLUMN_COUNT: usize = 21;
+
 fn sqlite_timestamp(time: chrono::DateTime<Utc>) -> String {
     time.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn optional_json_array(value: &Option<String>) -> Value {
+    value
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::tempdir;
 
     use crate::papers::loader::load_paper;
@@ -259,6 +509,10 @@ mod tests {
     use crate::papers::scanner::scan_paper_dirs;
     use crate::retrieval::chunker::chunk_paper;
     use crate::retrieval::fusion::rrf_merge_chunks;
+    use crate::retrieval::hybrid;
+    use crate::retrieval::profile_route::{
+        profile_grounding_chunks_for_keys, profile_grounding_chunks_for_keys_matching_terms,
+    };
     use crate::retrieval::query::query_terms;
     use rusqlite::Connection;
 
@@ -377,7 +631,7 @@ The reported conversion is 82%."#,
     }
 
     #[test]
-    fn chunks_for_paper_keys_prefers_meaningful_body_over_metadata() {
+    fn profile_grounding_chunks_prefers_meaningful_body_over_metadata() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
         for (paper_key, paper_id) in [("Alice/paper-a", "paper-a"), ("Alice/paper-b", "paper-b")] {
@@ -410,12 +664,12 @@ The reported conversion is 82%."#,
             )
             .unwrap();
 
-        let chunks = storage
-            .chunks_for_paper_keys(
-                &["Alice/paper-a".to_string(), "Alice/paper-b".to_string()],
-                2,
-            )
-            .unwrap();
+        let chunks = profile_grounding_chunks_for_keys(
+            &storage,
+            &["Alice/paper-a".to_string(), "Alice/paper-b".to_string()],
+            2,
+        )
+        .unwrap();
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].paper_key, "Alice/paper-a");
@@ -423,6 +677,61 @@ The reported conversion is 82%."#,
         assert!(chunks[0].text.contains("Abstract This paper"));
         assert_eq!(chunks[1].paper_key, "Alice/paper-b");
         assert_eq!(chunks[1].chunk_index, 0);
+    }
+
+    #[test]
+    fn profile_grounding_chunks_matching_terms_prefers_relevant_chunk() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        storage
+            .conn
+            .execute(
+                r#"
+                INSERT INTO papers (
+                    paper_key, author, paper_id, title, doi, year, source_hash,
+                    article_path, metadata_json, fetch_result_json
+                )
+                VALUES ('Alice/paper-a', 'Alice', 'paper-a', 'Thermal Paper', '10.1/test',
+                        '2024', 'hash', 'article.md', '{}', '{}')
+                "#,
+                [],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                r#"
+                INSERT INTO chunks (paper_key, chunk_index, section, text, section_kind)
+                VALUES
+                    ('Alice/paper-a', 1, 'Abstract', 'This paper studies thermal materials.', 'body'),
+                    ('Alice/paper-a', 7, 'Results', 'The device demonstrates CPU/GPU cooling with smart garments.', 'body'),
+                    ('Alice/paper-a', 8, 'References', 'Google Scholar Google Scholar phase change fabrics thermoregulation wearable phase change fabrics.', 'body')
+                "#,
+                [],
+            )
+            .unwrap();
+
+        let chunks = profile_grounding_chunks_for_keys_matching_terms(
+            &storage,
+            &["Alice/paper-a".to_string()],
+            &["CPU/GPU".to_string(), "smart garments".to_string()],
+            &[],
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(chunks[0].chunk_index, 7);
+
+        let aliased = profile_grounding_chunks_for_keys_matching_terms(
+            &storage,
+            &["Alice/paper-a".to_string()],
+            &["wearable".to_string(), "thermoregulation".to_string()],
+            &[],
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(aliased[0].chunk_index, 7);
     }
 
     #[test]
@@ -447,27 +756,113 @@ The reported conversion is 82%."#,
                     total_tokens: Some(18),
                     cost_usd: Some(0.001),
                     error_code: None,
+                    qa_profile_version: Some("v2"),
+                    qa_mode: Some("source_evidence"),
+                    route_reason: Some("detail_keyword"),
+                    delivery_mode: Some("streaming"),
+                    streaming_finalized: Some(true),
+                    stream_delta_count: Some(3),
+                    streamed_chars: Some(42),
+                    stream_first_delta_ms: Some(15),
+                    stream_duration_ms: Some(120),
+                    telegram_chat_id: Some(7),
+                    telegram_job_id: Some(42),
                 }),
             })
             .unwrap();
 
-        let (prompt_tokens, completion_tokens, total_tokens): (i64, i64, i64) = storage
+        let (
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            qa_profile_version,
+            qa_mode,
+            route_reason,
+            delivery_mode,
+            streaming_finalized,
+            stream_delta_count,
+            streamed_chars,
+            stream_first_delta_ms,
+            stream_duration_ms,
+        ): (
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            bool,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = storage
             .conn
             .query_row(
-                "SELECT prompt_tokens, completion_tokens, total_tokens FROM qa_logs LIMIT 1",
+                "SELECT prompt_tokens, completion_tokens, total_tokens, qa_profile_version, qa_mode, route_reason, delivery_mode, streaming_finalized, stream_delta_count, streamed_chars, stream_first_delta_ms, stream_duration_ms FROM qa_logs LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
             (prompt_tokens, completion_tokens, total_tokens),
             (11, 7, 18)
         );
+        assert_eq!(qa_profile_version, "v2");
+        assert_eq!(qa_mode, "source_evidence");
+        assert_eq!(route_reason, "detail_keyword");
+        assert_eq!(delivery_mode, "streaming");
+        assert!(streaming_finalized);
+        assert_eq!(
+            (
+                stream_delta_count,
+                streamed_chars,
+                stream_first_delta_ms,
+                stream_duration_ms
+            ),
+            (3, 42, 15, 120)
+        );
         let logs = storage.qa_logs(Some("Alice"), 5).unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].prompt_tokens, Some(11));
         assert_eq!(logs[0].completion_tokens, Some(7));
         assert_eq!(logs[0].total_tokens, Some(18));
+        assert_eq!(logs[0].qa_profile_version.as_deref(), Some("v2"));
+        assert_eq!(logs[0].qa_mode.as_deref(), Some("source_evidence"));
+        assert_eq!(logs[0].route_reason.as_deref(), Some("detail_keyword"));
+        assert_eq!(logs[0].delivery_mode.as_deref(), Some("streaming"));
+        assert_eq!(logs[0].streaming_finalized, Some(true));
+        assert_eq!(logs[0].stream_delta_count, Some(3));
+        assert_eq!(logs[0].streamed_chars, Some(42));
+        assert_eq!(logs[0].stream_first_delta_ms, Some(15));
+        assert_eq!(logs[0].stream_duration_ms, Some(120));
+        assert_eq!(logs[0].telegram_chat_id, Some(7));
+        assert_eq!(logs[0].telegram_job_id, Some(42));
+        let trend = storage.qa_log_trend(Some("Alice"), 7).unwrap();
+        assert_eq!(trend.len(), 1);
+        assert_eq!(trend[0].total, 1);
+        assert_eq!(trend[0].errors, 0);
+        assert_eq!(trend[0].streaming, 1);
+        assert_eq!(trend[0].streaming_finalized, 1);
+        assert_eq!(trend[0].telegram, 1);
+        assert_eq!(trend[0].total_tokens, Some(18));
+        assert!((trend[0].total_cost_usd.unwrap() - 0.001).abs() < f64::EPSILON);
         let status = storage.library_status(Some("Alice")).unwrap();
         assert_eq!(status.total_qa_tokens, Some(18));
         assert!((status.total_qa_cost_usd.unwrap() - 0.001).abs() < f64::EPSILON);
@@ -565,7 +960,16 @@ The reported conversion is 82%."#,
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 11);
+        let pending_author_selection_table_exists: i64 = storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'telegram_pending_author_selections'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_author_selection_table_exists, 1);
     }
 
     #[test]
@@ -1137,9 +1541,9 @@ The reported conversion is 82%."#,
             )
             .unwrap();
 
-        let chunks = storage
-            .search_chunks("Alice", "metric coulombic efficiency", 5)
-            .unwrap();
+        let (chunks, _) =
+            hybrid::search_chunks_with_trace(&storage, "Alice", "metric coulombic efficiency", 5)
+                .unwrap();
         let (source_hash, chunk_hash): (Option<String>, Option<String>) = storage
             .conn
             .query_row(
@@ -1174,6 +1578,14 @@ The reported conversion is 82%."#,
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         };
         let merged = rrf_merge_chunks(
             vec![
@@ -1205,6 +1617,14 @@ The reported conversion is 82%."#,
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         };
 
         storage
@@ -1258,6 +1678,14 @@ The reported conversion is 82%."#,
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         };
         storage
             .save_chunk_embedding(&chunk, "embed-model", Some("v1"), &[0.1, 0.2], "chunk-hash")
@@ -1357,9 +1785,10 @@ The reported conversion is 82%."#,
             raw_body: String::new(),
             clean_text: String::new(),
             sections: vec![Section {
-                title: "Table S1 Caption".to_string(),
+                title: "Table S1-S3 Caption".to_string(),
                 level: 2,
-                content: "Table S1: catalyst metrics".to_string(),
+                content: "Table S1-S3: catalyst metrics at 25 °C under 10 mA cm−2 with 82% yield."
+                    .to_string(),
             }],
         };
         let chunks = chunk_paper(&paper, 3200, 350);
@@ -1368,6 +1797,92 @@ The reported conversion is 82%."#,
         let stored = storage.all_chunks_for_author("Alice", None).unwrap();
 
         assert_eq!(stored[0].section_kind, "table_caption");
-        assert_eq!(stored[0].caption_label.as_deref(), Some("Table S1"));
+        assert_eq!(stored[0].caption_label.as_deref(), Some("Table S1-S3"));
+        assert_eq!(stored[0].caption_object_type.as_deref(), Some("table"));
+        assert_eq!(stored[0].caption_object_label.as_deref(), Some("S1-S3"));
+        assert!(stored[0].caption_panel_labels_json.is_none());
+        assert_eq!(stored[0].caption_panel_details_value(), Value::Null);
+        assert_eq!(
+            stored[0].caption_target_labels_value(),
+            json!(["Table S1", "Table S2", "Table S3"])
+        );
+        assert_eq!(
+            stored[0].caption_measurements_value(),
+            json!(["25 °C", "10 mA cm−2", "82%"])
+        );
+        assert_eq!(
+            stored[0].caption_conditions_value(),
+            json!(["at 25 °C", "under 10 mA cm−2", "with 82% yield"])
+        );
+        assert_eq!(stored[0].caption_values_value(), json!(["25", "10", "82%"]));
+    }
+
+    #[test]
+    fn upsert_paper_stores_caption_panel_details() {
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("test.sqlite")).unwrap();
+        let paper = Paper {
+            author: "Alice".to_string(),
+            paper_id: "paper-a".to_string(),
+            paper_dir: dir.path().to_path_buf(),
+            article_path: dir.path().join("article.md"),
+            fetch_result_path: None,
+            source_hash: "hash".to_string(),
+            metadata: BTreeMap::from([
+                ("title".to_string(), "Caption Paper".to_string()),
+                ("year".to_string(), "2024".to_string()),
+            ]),
+            fetch_result: json!({}),
+            raw_body: String::new(),
+            clean_text: String::new(),
+            sections: vec![Section {
+                title: "Figure 3 Caption".to_string(),
+                level: 2,
+                content: "Figure 3: (A) SEM image; (B) XRD pattern; (C) conversion reached 90%."
+                    .to_string(),
+            }],
+        };
+        let chunks = chunk_paper(&paper, 3200, 350);
+
+        storage.upsert_paper(&paper, &chunks).unwrap();
+        let stored = storage.all_chunks_for_author("Alice", None).unwrap();
+
+        assert_eq!(
+            stored[0].caption_panel_labels_value(),
+            json!(["A", "B", "C"])
+        );
+        assert_eq!(
+            stored[0].caption_target_labels_value(),
+            json!(["Figure 3A", "Figure 3B", "Figure 3C"])
+        );
+        assert_eq!(
+            stored[0].caption_panel_details_value(),
+            json!([
+                {
+                    "panel_label": "A",
+                    "target_label": "Figure 3A",
+                    "description": "SEM image",
+                    "measurements": [],
+                    "conditions": [],
+                    "values": []
+                },
+                {
+                    "panel_label": "B",
+                    "target_label": "Figure 3B",
+                    "description": "XRD pattern",
+                    "measurements": [],
+                    "conditions": [],
+                    "values": []
+                },
+                {
+                    "panel_label": "C",
+                    "target_label": "Figure 3C",
+                    "description": "conversion reached 90%",
+                    "measurements": ["conversion 90%", "90%"],
+                    "conditions": [],
+                    "values": ["90%"]
+                }
+            ])
+        );
     }
 }

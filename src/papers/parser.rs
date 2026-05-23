@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::models::Section;
 
-pub const PARSER_VERSION: &str = "markdown-parser-v2";
+pub const PARSER_VERSION: &str = "markdown-parser-v4";
 
 #[derive(Debug, Clone)]
 struct Caption {
@@ -192,7 +192,7 @@ fn parse_cjk_caption(line: &str, marker: char) -> Option<Caption> {
 fn parse_caption_tail(value: &str) -> Option<(String, String)> {
     let mut label_end = 0usize;
     for (index, ch) in value.char_indices() {
-        if ch.is_alphanumeric() || ch == '-' {
+        if is_caption_label_char(ch) || is_caption_label_comma(value, index) {
             label_end = index + ch.len_utf8();
         } else {
             break;
@@ -214,13 +214,39 @@ fn parse_caption_tail(value: &str) -> Option<(String, String)> {
 }
 
 fn normalize_caption_line(value: &str) -> String {
-    strip_inline_noise(value)
+    normalize_caption_punctuation(&strip_inline_noise(value))
         .replace('\u{00a0}', " ")
         .trim_start_matches(['-', '*', ' '])
         .replace("**", "")
         .replace("__", "")
         .trim()
         .to_string()
+}
+
+fn normalize_caption_punctuation(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '‐' | '‑' | '–' | '—' => '-',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn is_caption_label_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '-'
+}
+
+fn is_caption_label_comma(value: &str, comma_index: usize) -> bool {
+    let previous_is_label = value[..comma_index]
+        .chars()
+        .next_back()
+        .is_some_and(|ch| ch.is_alphanumeric());
+    let next_is_label = value[comma_index + ','.len_utf8()..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric());
+    previous_is_label && next_is_label
 }
 
 fn parse_simple_yaml(lines: &[String]) -> BTreeMap<String, String> {
@@ -362,6 +388,81 @@ mod tests {
                 .iter()
                 .any(|section| section.title == "Table S1 Caption"
                     && section.content == "Table S1: Catalyst metrics.")
+        );
+    }
+
+    #[test]
+    fn extracts_compound_caption_labels() {
+        let sections = parse_sections(
+            "Fig. S1a,b. Schematic and SEM images.\nFigure 2A–C: Stability series.\nTable S2–S4. Catalyst metrics.",
+        );
+
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Figure S1a,b Caption"
+                    && section.caption_label().as_deref() == Some("Figure S1a,b")
+                    && section.content == "Figure S1a,b: Schematic and SEM images.")
+        );
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Figure 2A-C Caption"
+                    && section.caption_label().as_deref() == Some("Figure 2A-C")
+                    && section.content == "Figure 2A-C: Stability series.")
+        );
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.title == "Table S2-S4 Caption"
+                    && section.caption_label().as_deref() == Some("Table S2-S4")
+                    && section.content == "Table S2-S4: Catalyst metrics.")
+        );
+    }
+
+    #[test]
+    fn extracts_structured_caption_metadata() {
+        let sections = parse_sections(
+            "Fig. S1a,b. Schematic and SEM images.\nFigure 2A–C: Stability series.\nTable S2–S4. Catalyst metrics.",
+        );
+
+        let figure_panels = sections
+            .iter()
+            .find(|section| section.title == "Figure S1a,b Caption")
+            .and_then(|section| section.caption_metadata())
+            .unwrap();
+        assert_eq!(figure_panels.object_type, "figure");
+        assert_eq!(figure_panels.object_label, "S1");
+        assert_eq!(figure_panels.panel_labels, vec!["a", "b"]);
+        assert_eq!(
+            figure_panels.target_labels,
+            vec!["Figure S1a", "Figure S1b"]
+        );
+
+        let figure_range = sections
+            .iter()
+            .find(|section| section.title == "Figure 2A-C Caption")
+            .and_then(|section| section.caption_metadata())
+            .unwrap();
+        assert_eq!(figure_range.object_type, "figure");
+        assert_eq!(figure_range.object_label, "2");
+        assert_eq!(figure_range.panel_labels, vec!["A", "B", "C"]);
+        assert_eq!(
+            figure_range.target_labels,
+            vec!["Figure 2A", "Figure 2B", "Figure 2C"]
+        );
+
+        let table_range = sections
+            .iter()
+            .find(|section| section.title == "Table S2-S4 Caption")
+            .and_then(|section| section.caption_metadata())
+            .unwrap();
+        assert_eq!(table_range.object_type, "table");
+        assert_eq!(table_range.object_label, "S2-S4");
+        assert!(table_range.panel_labels.is_empty());
+        assert_eq!(
+            table_range.target_labels,
+            vec!["Table S2", "Table S3", "Table S4"]
         );
     }
 }

@@ -1,0 +1,48 @@
+name: Regression
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  schedule:
+    - cron: "23 19 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: Rust regression and V2 gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CHECK_PAPER_REGRESSION_REPORT_DIR: ${{ runner.temp }}/check-paper-eval-gate
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run regression gate
+        run: scripts/regression-check.sh
+
+      - name: Upload regression reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-reports
+          path: ${{ env.CHECK_PAPER_REGRESSION_REPORT_DIR }}/*.md
+          if-no-files-found: ignore

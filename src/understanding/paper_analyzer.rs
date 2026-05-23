@@ -134,6 +134,14 @@ pub fn extract_section_facts(
                 "section": chunk.section,
                 "section_kind": chunk.section_kind,
                 "caption_label": chunk.caption_label,
+                "caption_object_type": chunk.caption_object_type,
+                "caption_object_label": chunk.caption_object_label,
+                "caption_panel_labels": optional_json_array(&chunk.caption_panel_labels_json),
+                "caption_target_labels": optional_json_array(&chunk.caption_target_labels_json),
+                "caption_panel_details": optional_json_array(&chunk.caption_panel_details_json),
+                "caption_measurements": optional_json_array(&chunk.caption_measurements_json),
+                "caption_conditions": optional_json_array(&chunk.caption_conditions_json),
+                "caption_values": optional_json_array(&chunk.caption_values_json),
                 "fact_type": fact_type,
                 "text": chunk.text,
             }))
@@ -168,6 +176,13 @@ fn section_fact_type(section: &str, section_kind: &str) -> Option<&'static str> 
     } else {
         None
     }
+}
+
+fn optional_json_array(value: &Option<String>) -> Value {
+    value
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(Value::Null)
 }
 
 fn is_caption_section(section: &str, prefix: &str) -> bool {

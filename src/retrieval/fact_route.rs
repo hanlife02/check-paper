@@ -1,14 +1,6 @@
 use anyhow::Result;
 
-use crate::storage::SourceChunk;
-use crate::storage::Storage;
-
-#[derive(Debug, Clone)]
-pub struct FactRouteCandidate {
-    pub chunk: SourceChunk,
-    pub fact_type: String,
-    pub fact_json: String,
-}
+use crate::storage::{FactRouteCandidate, SourceChunk, Storage};
 
 pub(crate) fn search_fact_route(
     storage: &Storage,
@@ -67,7 +59,7 @@ fn query_matches_needle(query: &str, needle: &str) -> bool {
     query.contains(needle)
 }
 
-pub fn rank_fact_chunks(
+pub(crate) fn rank_fact_chunks(
     candidates: Vec<FactRouteCandidate>,
     terms: &[String],
     limit: usize,
@@ -135,6 +127,14 @@ mod tests {
             chunker_version: "section-char-v1".to_string(),
             section_kind: "body".to_string(),
             caption_label: None,
+            caption_object_type: None,
+            caption_object_label: None,
+            caption_panel_labels_json: None,
+            caption_target_labels_json: None,
+            caption_panel_details_json: None,
+            caption_measurements_json: None,
+            caption_conditions_json: None,
+            caption_values_json: None,
         }
     }
 

@@ -13,6 +13,7 @@ pub struct Settings {
     pub paper_root: PathBuf,
     pub db_path: PathBuf,
     pub default_author: Option<String>,
+    pub qa_profile_version: String,
     pub proxy: Option<String>,
     pub llm_base_url: String,
     pub llm_api_key: Option<String>,
@@ -34,6 +35,7 @@ pub struct Settings {
     pub chunker_version: String,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_ids: Vec<i64>,
+    pub telegram_admin_user_ids: Vec<i64>,
 }
 
 impl Settings {
@@ -47,6 +49,7 @@ impl Settings {
                 "data/check_paper.sqlite",
             )),
             default_author: empty_to_none(setting(&config, "CHECK_PAPER_DEFAULT_AUTHOR", "")),
+            qa_profile_version: setting(&config, "CHECK_PAPER_QA_PROFILE_VERSION", "v1"),
             proxy: empty_to_none(setting(&config, "CHECK_PAPER_PROXY", "")),
             llm_base_url: setting(
                 &config,
@@ -107,6 +110,11 @@ impl Settings {
             chunker_version: setting(&config, "CHECK_PAPER_CHUNKER_VERSION", "section-char-v1"),
             telegram_bot_token: empty_to_none(setting(&config, "TELEGRAM_BOT_TOKEN", "")),
             telegram_chat_ids: parse_i64_list(&setting(&config, "TELEGRAM_CHAT_IDS", "")),
+            telegram_admin_user_ids: parse_i64_list(&setting(
+                &config,
+                "TELEGRAM_ADMIN_USER_IDS",
+                "",
+            )),
         }
     }
 

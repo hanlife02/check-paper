@@ -117,6 +117,80 @@ impl Storage {
         Ok(count as usize)
     }
 
+    pub fn paper_keys_with_current_chunk_facts(
+        &self,
+        author: &str,
+        extractor: &str,
+        extractor_version: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let mut sql = r#"
+            SELECT f.paper_key, MAX(p.year) AS year_sort, MAX(p.title) AS title_sort
+            FROM chunk_facts f
+            JOIN chunks c ON c.id = f.chunk_id
+            JOIN papers p ON p.paper_key = f.paper_key
+            WHERE p.author = ?
+              AND f.extractor = ?
+              AND f.extractor_version = ?
+              AND f.source_hash = c.source_hash
+              AND f.chunk_hash = c.chunk_hash
+            GROUP BY f.paper_key
+            ORDER BY year_sort DESC, title_sort ASC
+        "#
+        .to_string();
+        if limit.is_some() {
+            sql.push_str(" LIMIT ?");
+        }
+        let mut keys = Vec::new();
+        if let Some(limit) = limit {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![author, extractor, extractor_version, limit as i64],
+                |row| row.get(0),
+            )?;
+            for row in rows {
+                keys.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![author, extractor, extractor_version], |row| {
+                row.get(0)
+            })?;
+            for row in rows {
+                keys.push(row?);
+            }
+        }
+        Ok(keys)
+    }
+
+    pub fn current_chunk_facts_for_paper(
+        &self,
+        paper_key: &str,
+        extractor: &str,
+        extractor_version: &str,
+    ) -> Result<Vec<ChunkFact>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT f.chunk_fact_id, f.claim_uid, f.paper_key, f.chunk_id, f.fact_type,
+                   f.fact_json, f.confidence, f.extractor, f.extractor_version,
+                   f.source_hash, f.chunk_hash, f.created_at
+            FROM chunk_facts f
+            JOIN chunks c ON c.id = f.chunk_id
+            WHERE f.paper_key = ?
+              AND f.extractor = ?
+              AND f.extractor_version = ?
+              AND f.source_hash = c.source_hash
+              AND f.chunk_hash = c.chunk_hash
+            ORDER BY c.chunk_index ASC, f.fact_type ASC, f.chunk_fact_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![paper_key, extractor, extractor_version], |row| {
+            chunk_fact_from_row(row)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn record_chunk_fact_failure(
         &self,
         chunk: &SourceChunk,

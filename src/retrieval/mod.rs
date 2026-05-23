@@ -1,3 +1,4 @@
+pub mod chunk_rank;
 pub mod chunker;
 pub mod dense_route;
 pub mod embedding;

@@ -3,7 +3,10 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::retrieval::embedding::encode_f32_vector;
 
-use super::{SourceChunk, Storage, source_chunk_from_row};
+use super::{
+    SOURCE_CHUNK_COLUMN_COUNT, SOURCE_CHUNK_SELECT_COLUMNS, SourceChunk, Storage,
+    source_chunk_from_row,
+};
 
 impl Storage {
     pub fn has_current_chunk_embedding(
@@ -98,18 +101,15 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn chunk_embeddings_for_model(
+    pub(crate) fn embedding_route_candidates(
         &self,
         author: &str,
         model: &str,
         model_version: Option<&str>,
     ) -> Result<Vec<(SourceChunk, Vec<u8>)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            SELECT c.id, c.paper_key, c.chunk_index, c.section, c.text,
-                   p.title, p.doi, p.year, p.source_hash,
-                   COALESCE(c.chunk_hash, ''), COALESCE(c.chunker_version, ''),
-                   COALESCE(c.section_kind, 'body'), c.caption_label,
+            SELECT {SOURCE_CHUNK_SELECT_COLUMNS},
                    e.vector
             FROM embeddings e
             JOIN chunks c ON c.id = CAST(e.target_id AS INTEGER)
@@ -119,12 +119,19 @@ impl Storage {
               AND COALESCE(e.model_version, '') = COALESCE(?, '')
               AND p.author = ?
             "#,
+        ))?;
+        let rows = stmt.query_map(
+            params![model, model_version, author],
+            embedding_candidate_from_row,
         )?;
-        let rows = stmt.query_map(params![model, model_version, author], |row| {
-            let vector: Vec<u8> = row.get(13)?;
-            Ok((source_chunk_from_row(row)?, vector))
-        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+}
+
+fn embedding_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(SourceChunk, Vec<u8>)> {
+    let vector = row.get(SOURCE_CHUNK_COLUMN_COUNT)?;
+    Ok((source_chunk_from_row(row)?, vector))
 }
