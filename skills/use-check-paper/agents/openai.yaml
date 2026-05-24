@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use check-paper"
+  short_description: "Run and operate the local check-paper Evidence QA service"
+  default_prompt: "Use this check-paper service locally: verify config, start Telegram polling, run CLI QA, and inspect logs."

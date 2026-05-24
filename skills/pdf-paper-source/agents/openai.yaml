@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF paper source"
+  short_description: "Convert PDFs into check-paper paper source directories"
+  default_prompt: "Import selected PDF papers into paper/<AUTHOR>/<PAPER_ID>/article.md for check-paper."
