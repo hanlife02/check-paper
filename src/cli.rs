@@ -1143,8 +1143,9 @@ fn check_tg_service_template(output: &Path, expected: &str) -> Result<TgServiceC
 }
 
 fn telegram_get_me(token: &str, proxy: Option<&str>) -> Result<TelegramBotStatus> {
-    let mut builder =
-        ClientBuilder::new().timeout(Duration::from_secs(TELEGRAM_STATUS_TIMEOUT_SECS));
+    let mut builder = ClientBuilder::new()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(TELEGRAM_STATUS_TIMEOUT_SECS));
     if let Some(proxy) = proxy {
         builder = builder.proxy(Proxy::all(proxy)?);
     }
@@ -1575,8 +1576,9 @@ fn format_tg_health_alert(settings: &Settings, heartbeat: Option<&RuntimeHeartbe
 }
 
 fn telegram_send_message(token: &str, proxy: Option<&str>, chat_id: i64, text: &str) -> Result<()> {
-    let mut builder =
-        ClientBuilder::new().timeout(Duration::from_secs(TELEGRAM_STATUS_TIMEOUT_SECS));
+    let mut builder = ClientBuilder::new()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(TELEGRAM_STATUS_TIMEOUT_SECS));
     if let Some(proxy) = proxy {
         builder = builder.proxy(Proxy::all(proxy)?);
     }

@@ -602,8 +602,9 @@ impl TelegramBot {
 }
 
 fn http_client(proxy: Option<&str>) -> Result<Client> {
-    let mut builder =
-        ClientBuilder::new().timeout(Duration::from_secs(TELEGRAM_REQUEST_TIMEOUT_SECS));
+    let mut builder = ClientBuilder::new()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(TELEGRAM_REQUEST_TIMEOUT_SECS));
     if let Some(proxy) = proxy {
         builder = builder.proxy(Proxy::all(proxy)?);
     }
